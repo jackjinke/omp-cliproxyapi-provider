@@ -1,6 +1,7 @@
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type { ExtensionAPI, ProviderConfig } from "@oh-my-pi/pi-coding-agent";
+import { modelsDevCachePath } from "./models-dev.ts";
 import {
   CREDENTIAL_TTL_MS,
   fetchModels,
@@ -25,6 +26,7 @@ function credentialBaseUrl(value: string): string | undefined {
 export function createProvider(
   settings: ResolvedSettings,
   fetcher: FetchImpl = fetch,
+  modelsDevCacheFile: string = modelsDevCachePath(),
 ): ProviderConfig {
   let activeBaseUrl = settings.baseUrl;
 
@@ -51,7 +53,7 @@ export function createProvider(
         if (!apiKey) throw new Error("CLIProxyAPI API key cannot be empty");
 
         callbacks.onProgress?.("Validating CLIProxyAPI credentials...");
-        await fetchModels(baseUrl, apiKey, fetcher);
+        await fetchModels(baseUrl, apiKey, fetcher, modelsDevCacheFile);
         writeConfig(settings.agentDir, { baseUrl, apiKey });
         activeBaseUrl = baseUrl;
         return {
@@ -74,7 +76,7 @@ export function createProvider(
       },
     },
     fetchDynamicModels(apiKey: string | undefined) {
-      return apiKey ? fetchModels(activeBaseUrl, apiKey, fetcher) : Promise.resolve([]);
+      return apiKey ? fetchModels(activeBaseUrl, apiKey, fetcher, modelsDevCacheFile) : Promise.resolve([]);
     },
   };
 }

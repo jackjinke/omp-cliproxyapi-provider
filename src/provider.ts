@@ -4,6 +4,12 @@ import { dirname, join } from "node:path";
 import { Effort } from "@oh-my-pi/pi-catalog";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
+import {
+  type ExternalModelMetadata,
+  loadModelsDevMetadata,
+  modelsDevCachePath,
+} from "./models-dev.ts";
+import { isJsonObject, type JsonObject } from "./type-guards.ts";
 
 export const PROVIDER_ID = "cliproxyapi";
 export const PROVIDER_NAME = "CLIProxyAPI";
@@ -26,18 +32,6 @@ export interface ResolvedSettings {
   agentDir: string;
   baseUrl: string;
   apiKey?: string;
-}
-
-interface CatalogModel {
-  slug?: unknown;
-  id?: unknown;
-  display_name?: unknown;
-  name?: unknown;
-  context_window?: unknown;
-  max_context_window?: unknown;
-  input_modalities?: unknown;
-  supported_reasoning_levels?: unknown;
-  visibility?: unknown;
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -103,7 +97,11 @@ export function resolveSettings(
   };
 }
 
-export function resolveEndpoints(baseUrlInput: string): { inferenceBaseUrl: string; modelsUrl: string } {
+export function resolveEndpoints(baseUrlInput: string): {
+  inferenceBaseUrl: string;
+  rawModelsUrl: string;
+  codexModelsUrl: string;
+} {
   let raw = baseUrlInput.trim();
   if (!raw) throw new Error("CLIProxyAPI base URL is empty");
   if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
@@ -119,13 +117,15 @@ export function resolveEndpoints(baseUrlInput: string): { inferenceBaseUrl: stri
   }
 
   const rootPath = path.slice(0, -"/backend-api".length);
+  const rawModelsUrl = `${url.origin}${rootPath}/v1/models`;
   return {
     inferenceBaseUrl: `${url.origin}${path}/`,
-    modelsUrl: `${url.origin}${rootPath}/v1/models?client_version=pi`,
+    rawModelsUrl,
+    codexModelsUrl: `${rawModelsUrl}?client_version=pi`,
   };
 }
 
-function catalogEntries(payload: unknown): CatalogModel[] {
+function catalogEntries(payload: unknown): JsonObject[] {
   const values = Array.isArray(payload)
     ? payload
     : payload && typeof payload === "object" && "models" in payload && Array.isArray(payload.models)
@@ -133,50 +133,57 @@ function catalogEntries(payload: unknown): CatalogModel[] {
       : payload && typeof payload === "object" && "data" in payload && Array.isArray(payload.data)
         ? payload.data
         : [];
-  return values.filter((value): value is CatalogModel => Boolean(value) && typeof value === "object" && !Array.isArray(value));
+  return values.filter(isJsonObject);
 }
 
-function reasoningEfforts(model: CatalogModel): SupportedEffort[] {
+function reasoningEfforts(model: JsonObject): SupportedEffort[] {
   if (!Array.isArray(model.supported_reasoning_levels)) return [];
   const values = new Set<string>();
   for (const entry of model.supported_reasoning_levels) {
-    const rawEffort = entry && typeof entry === "object" && "effort" in entry ? entry.effort : entry;
+    const rawEffort = isJsonObject(entry) && "effort" in entry ? entry.effort : entry;
     const effort = nonEmptyString(rawEffort);
     if (effort) values.add(effort.toLowerCase());
   }
   return SUPPORTED_EFFORTS.filter(effort => values.has(effort));
 }
 
-function inputModalities(model: CatalogModel): Array<"text" | "image"> {
+function inputModalities(model: JsonObject): Array<"text" | "image"> {
   const hasImage = Array.isArray(model.input_modalities)
     && model.input_modalities.some(value => nonEmptyString(value)?.toLowerCase() === "image");
   return hasImage ? ["text", "image"] : ["text"];
 }
 
-export function mapCatalogModel(model: CatalogModel): ProviderModelConfig | null {
+export function mapCatalogModel(
+  model: JsonObject,
+  metadata?: ExternalModelMetadata,
+): ProviderModelConfig | null {
   const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);
   if (!id || nonEmptyString(model.visibility)?.toLowerCase() === "hide") return null;
 
-  const efforts = reasoningEfforts(model);
+  const metadataEfforts = new Set(metadata?.efforts?.map(effort => effort.toLowerCase()) ?? []);
+  const externalEfforts = SUPPORTED_EFFORTS.filter(effort => metadataEfforts.has(effort));
+  const efforts = metadata?.reasoning === false
+    ? []
+    : externalEfforts.length > 0
+      ? externalEfforts
+      : reasoningEfforts(model);
+  const reasoning = metadata?.reasoning ?? efforts.length > 0;
+
   return {
     id,
-    name: nonEmptyString(model.display_name) ?? nonEmptyString(model.name) ?? id,
-    reasoning: efforts.length > 0,
-    ...(efforts.length > 0 ? { thinking: { mode: "effort" as const, efforts } } : {}),
-    input: inputModalities(model),
-    cost: { ...ZERO_COST },
-    contextWindow: positiveInteger(model.context_window, positiveInteger(model.max_context_window, 128_000)),
-    maxTokens: 16_384,
+    name: metadata?.name ?? nonEmptyString(model.display_name) ?? nonEmptyString(model.name) ?? id,
+    reasoning,
+    ...(reasoning && efforts.length > 0 ? { thinking: { mode: "effort" as const, efforts } } : {}),
+    input: metadata?.input ?? inputModalities(model),
+    cost: metadata?.cost ?? { ...ZERO_COST },
+    contextWindow: metadata?.contextWindow
+      ?? positiveInteger(model.context_window, positiveInteger(model.max_context_window, 128_000)),
+    maxTokens: metadata?.maxTokens ?? 16_384,
   };
 }
 
-export async function fetchModels(
-  baseUrl: string,
-  apiKey: string,
-  fetcher: FetchImpl = fetch,
-): Promise<ProviderModelConfig[]> {
-  const { modelsUrl } = resolveEndpoints(baseUrl);
-  const response = await fetcher(modelsUrl, {
+async function fetchCatalog(url: string, apiKey: string, fetcher: FetchImpl): Promise<JsonObject[]> {
+  const response = await fetcher(url, {
     headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
@@ -184,12 +191,41 @@ export async function fetchModels(
     const detail = (await response.text().catch(() => "")).slice(0, 200);
     throw new Error(`CLIProxyAPI models request failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
   }
-
-  let payload: unknown;
   try {
-    payload = await response.json();
+    return catalogEntries(await response.json());
   } catch {
     return [];
   }
-  return catalogEntries(payload).map(mapCatalogModel).filter((model): model is ProviderModelConfig => model !== null);
+}
+
+export async function fetchModels(
+  baseUrl: string,
+  apiKey: string,
+  fetcher: FetchImpl = fetch,
+  modelsDevCacheFile: string = modelsDevCachePath(),
+): Promise<ProviderModelConfig[]> {
+  const endpoints = resolveEndpoints(baseUrl);
+  const [rawModels, codexModels] = await Promise.all([
+    fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher),
+    fetchCatalog(endpoints.codexModelsUrl, apiKey, fetcher),
+  ]);
+
+  const identities = rawModels.flatMap(model => {
+    const id = nonEmptyString(model.id);
+    return id ? [{ id, owner: nonEmptyString(model.owned_by) }] : [];
+  });
+  const externalMetadata = await loadModelsDevMetadata(identities, fetcher, modelsDevCacheFile);
+  const codexById = new Map<string, JsonObject>();
+  for (const model of codexModels) {
+    const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);
+    if (id) codexById.set(id, model);
+  }
+
+  return rawModels
+    .map(rawModel => {
+      const id = nonEmptyString(rawModel.id);
+      if (!id) return null;
+      return mapCatalogModel(codexById.get(id) ?? rawModel, externalMetadata.get(id));
+    })
+    .filter((model): model is ProviderModelConfig => model !== null);
 }
