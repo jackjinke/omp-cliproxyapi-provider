@@ -18,6 +18,7 @@ import {
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const CPA_ROOT = "http://llm.example:8317";
 const RAW_MODELS_URL = `${CPA_ROOT}/v1/models`;
+const RICH_MODELS_URL = `${RAW_MODELS_URL}?client_version=pi`;
 
 const MODELS_DEV_FIXTURE = {
   "opencode-go": {
@@ -75,14 +76,17 @@ describe("endpoint resolution", () => {
     expect(resolveEndpoints("llm.example:8317")).toEqual({
       inferenceBaseUrl: "http://llm.example:8317/backend-api/",
       rawModelsUrl: "http://llm.example:8317/v1/models",
+      richModelsUrl: "http://llm.example:8317/v1/models?client_version=pi",
     });
     expect(resolveEndpoints("https://llm.example/prefix/v1")).toEqual({
       inferenceBaseUrl: "https://llm.example/prefix/backend-api/",
       rawModelsUrl: "https://llm.example/prefix/v1/models",
+      richModelsUrl: "https://llm.example/prefix/v1/models?client_version=pi",
     });
     expect(resolveEndpoints("https://llm.example/backend-api/")).toEqual({
       inferenceBaseUrl: "https://llm.example/backend-api/",
       rawModelsUrl: "https://llm.example/v1/models",
+      richModelsUrl: "https://llm.example/v1/models?client_version=pi",
     });
   });
 });
@@ -217,6 +221,124 @@ describe("metadata enrichment", () => {
     const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
     expect(model?.contextWindow).toBe(900_000);
     expect(model?.maxTokens).toBe(90_000);
+  });
+
+  test("uses rich CPA metadata when a native owner has no models.dev match", async () => {
+    const agentDir = temporaryAgentDir();
+    const requests: RecordedRequest[] = [];
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: {
+        data: [
+          { id: "kimi-k3", owned_by: "moonshot" },
+          { id: "kimi-k3-256k", owned_by: "moonshot" },
+        ],
+      },
+      [RICH_MODELS_URL]: {
+        models: [
+          {
+            slug: "kimi-k3",
+            display_name: "Kimi K3",
+            context_window: 1_048_576,
+            input_modalities: ["text", "image"],
+            supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }, { effort: "max" }],
+          },
+          {
+            slug: "kimi-k3-256k",
+            display_name: "Kimi K3 256K",
+            context_window: 262_144,
+            input_modalities: ["text", "image"],
+            supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }, { effort: "max" }],
+          },
+        ],
+      },
+      [MODELS_DEV_URL]: {},
+    }, requests);
+
+    const models = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
+    expect(models).toMatchObject([
+      {
+        id: "kimi-k3",
+        name: "Kimi K3",
+        contextWindow: 1_048_576,
+        maxTokens: 128_000,
+        reasoning: true,
+        input: ["text", "image"],
+      },
+      {
+        id: "kimi-k3-256k",
+        name: "Kimi K3 256K",
+        contextWindow: 262_144,
+        maxTokens: 128_000,
+        reasoning: true,
+        input: ["text", "image"],
+      },
+    ]);
+    expect(Array.from(models[0]?.thinking?.efforts ?? [], String)).toEqual(["low", "high", "max"]);
+    expect(requests.filter(request => request.url === RAW_MODELS_URL || request.url === RICH_MODELS_URL))
+      .toHaveLength(2);
+  });
+
+  test("prefers models.dev over rich metadata for exact owner matches", async () => {
+    const agentDir = temporaryAgentDir();
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: { data: [{ id: "grok-4.5", owned_by: "xai" }] },
+      [RICH_MODELS_URL]: {
+        models: [{
+          slug: "grok-4.5",
+          display_name: "Wrong rich metadata",
+          context_window: 272_000,
+          supported_reasoning_levels: [{ effort: "medium" }],
+        }],
+      },
+      [MODELS_DEV_URL]: {
+        "x-ai": {
+          id: "x-ai",
+          name: "xAI",
+          models: {
+            "grok-4.5": {
+              id: "grok-4.5",
+              name: "Grok 4.5",
+              reasoning: true,
+              reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+              modalities: { input: ["text", "image"], output: ["text"] },
+              limit: { context: 500_000, output: 500_000 },
+            },
+          },
+        },
+      },
+    });
+
+    const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
+    expect(model).toMatchObject({
+      name: "Grok 4.5",
+      contextWindow: 500_000,
+      maxTokens: 500_000,
+      input: ["text", "image"],
+    });
+  });
+
+  test("ignores rich metadata for unknown compatibility owners", async () => {
+    const agentDir = temporaryAgentDir();
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: { data: [{ id: "unknown", owned_by: "Gateway" }] },
+      [RICH_MODELS_URL]: {
+        models: [{
+          slug: "unknown",
+          display_name: "Synthesized metadata",
+          context_window: 272_000,
+          supported_reasoning_levels: [{ effort: "medium" }],
+        }],
+      },
+      [MODELS_DEV_URL]: {},
+    });
+
+    const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
+    expect(model).toMatchObject({
+      name: "unknown",
+      contextWindow: 128_000,
+      maxTokens: 16_384,
+      reasoning: false,
+    });
   });
 
   test("replaces an invalid cache and reuses the fresh catalog", async () => {

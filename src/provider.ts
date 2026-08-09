@@ -22,6 +22,14 @@ export const CREDENTIAL_TTL_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 const SUPPORTED_EFFORTS = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const;
+const RICH_CATALOG_MAX_TOKENS = 128_000;
+const CPA_NATIVE_OWNERS: Record<string, true> = {
+  anthropic: true,
+  google: true,
+  moonshot: true,
+  openai: true,
+  xai: true,
+};
 type SupportedEffort = (typeof SUPPORTED_EFFORTS)[number];
 
 function bundledCodexMetadata(model: ModelIdentity): ExternalModelMetadata | undefined {
@@ -120,6 +128,7 @@ export function resolveSettings(
 export function resolveEndpoints(baseUrlInput: string): {
   inferenceBaseUrl: string;
   rawModelsUrl: string;
+  richModelsUrl: string;
 } {
   let raw = baseUrlInput.trim();
   if (!raw) throw new Error("CLIProxyAPI base URL is empty");
@@ -140,6 +149,7 @@ export function resolveEndpoints(baseUrlInput: string): {
   return {
     inferenceBaseUrl: `${url.origin}${path}/`,
     rawModelsUrl,
+    richModelsUrl: `${rawModelsUrl}?client_version=pi`,
   };
 }
 
@@ -169,6 +179,31 @@ function inputModalities(model: JsonObject): Array<"text" | "image"> {
   const hasImage = Array.isArray(model.input_modalities)
     && model.input_modalities.some(value => nonEmptyString(value)?.toLowerCase() === "image");
   return hasImage ? ["text", "image"] : ["text"];
+}
+
+function richCatalogMetadata(model: JsonObject): ExternalModelMetadata {
+  const efforts = reasoningEfforts(model);
+  return {
+    name: nonEmptyString(model.display_name) ?? nonEmptyString(model.name),
+    reasoning: efforts.length > 0,
+    efforts,
+    input: inputModalities(model),
+    contextWindow: positiveInteger(model.context_window, positiveInteger(model.max_context_window, 128_000)),
+    // CPA's Codex-client response omits output limits; match OMP's native Codex discovery default.
+    maxTokens: RICH_CATALOG_MAX_TOKENS,
+  };
+}
+
+function nativeRichMetadata(
+  identity: ModelIdentity,
+  richModelsById: ReadonlyMap<string, JsonObject>,
+): ExternalModelMetadata | undefined {
+  if (
+    !identity.owner
+    || CPA_NATIVE_OWNERS[identity.owner.toLowerCase().replace(/[^a-z0-9]+/g, "")] !== true
+  ) return undefined;
+  const richModel = richModelsById.get(identity.id);
+  return richModel ? richCatalogMetadata(richModel) : undefined;
 }
 
 export function mapCatalogModel(
@@ -223,13 +258,20 @@ export async function fetchModels(
   modelsDevCacheFile: string = modelsDevCachePath(agentDirectory()),
 ): Promise<ProviderModelConfig[]> {
   const endpoints = resolveEndpoints(baseUrl);
-  const rawModels = await fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher);
+  const [rawModels, richModels] = await Promise.all([
+    fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher),
+    fetchCatalog(endpoints.richModelsUrl, apiKey, fetcher).catch(() => []),
+  ]);
 
   const identities = rawModels.flatMap(model => {
     const id = nonEmptyString(model.id);
     return id ? [{ id, owner: nonEmptyString(model.owned_by) }] : [];
   });
   const identityById = new Map(identities.map(identity => [identity.id, identity]));
+  const richModelsById = new Map(richModels.flatMap(model => {
+    const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);
+    return id ? [[id, model] as const] : [];
+  }));
   const externalMetadata = await loadModelsDevMetadata(identities, modelsDevCacheFile, fetcher);
 
   return rawModels
@@ -237,7 +279,11 @@ export async function fetchModels(
       const id = nonEmptyString(rawModel.id);
       if (!id) return null;
       const identity = identityById.get(id);
-      const metadata = identity ? bundledCodexMetadata(identity) ?? externalMetadata.get(id) : externalMetadata.get(id);
+      const metadata = identity
+        ? bundledCodexMetadata(identity)
+          ?? externalMetadata.get(id)
+          ?? nativeRichMetadata(identity, richModelsById)
+        : externalMetadata.get(id);
       return mapCatalogModel(rawModel, metadata);
     })
     .filter((model): model is ProviderModelConfig => model !== null);
