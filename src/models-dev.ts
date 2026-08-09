@@ -1,6 +1,5 @@
-import { readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { isJsonObject, type JsonObject } from "./type-guards.ts";
 
@@ -35,8 +34,8 @@ function providerKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-export function modelsDevCachePath(): string {
-  return join(tmpdir(), "omp-cliproxyapi-provider-models-dev.json");
+export function modelsDevCachePath(agentDir: string): string {
+  return join(agentDir, "tmp", "models.dev.json");
 }
 
 function isModelsDevCatalog(value: unknown): value is JsonObject {
@@ -63,6 +62,7 @@ function readFreshCatalog(path: string): JsonObject | undefined {
 }
 
 function writeCatalogFile(path: string, catalog: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
   const temporaryPath = `${path}.${process.pid}.tmp`;
   writeFileSync(temporaryPath, JSON.stringify(catalog), "utf8");
   renameSync(temporaryPath, path);
@@ -156,8 +156,8 @@ function findProviderModel(models: JsonObject, rawId: string): JsonObject | unde
 
 export async function loadModelsDevMetadata(
   models: readonly ModelIdentity[],
+  cacheFile: string,
   fetcher: FetchImpl = fetch,
-  cacheFile: string = modelsDevCachePath(),
 ): Promise<Map<string, ExternalModelMetadata>> {
   const catalog = await loadCatalog(fetcher, cacheFile);
   if (!catalog) return new Map();

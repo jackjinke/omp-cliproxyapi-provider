@@ -202,7 +202,7 @@ export async function fetchModels(
   baseUrl: string,
   apiKey: string,
   fetcher: FetchImpl = fetch,
-  modelsDevCacheFile: string = modelsDevCachePath(),
+  modelsDevCacheFile: string = modelsDevCachePath(agentDirectory()),
 ): Promise<ProviderModelConfig[]> {
   const endpoints = resolveEndpoints(baseUrl);
   const [rawModels, codexModels] = await Promise.all([
@@ -214,7 +214,7 @@ export async function fetchModels(
     const id = nonEmptyString(model.id);
     return id ? [{ id, owner: nonEmptyString(model.owned_by) }] : [];
   });
-  const externalMetadata = await loadModelsDevMetadata(identities, fetcher, modelsDevCacheFile);
+  const externalMetadata = await loadModelsDevMetadata(identities, modelsDevCacheFile, fetcher);
   const codexById = new Map<string, JsonObject>();
   for (const model of codexModels) {
     const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);

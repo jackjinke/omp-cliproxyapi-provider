@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import { createProvider } from "../src/index.ts";
-import { loadModelsDevMetadata } from "../src/models-dev.ts";
+import { loadModelsDevMetadata, modelsDevCachePath } from "../src/models-dev.ts";
 import {
   CONFIG_FILE_NAME,
   fetchModels,
@@ -57,7 +57,7 @@ function temporaryAgentDir(): string {
 }
 
 function cacheFile(agentDir: string): string {
-  return join(agentDir, "models-dev.json");
+  return modelsDevCachePath(agentDir);
 }
 
 function routeFetcher(routes: Record<string, unknown>, requests: RecordedRequest[] = []): FetchImpl {
@@ -101,6 +101,10 @@ describe("configuration", () => {
       CLIPROXYAPI_BASE_URL: "http://env:8317",
       CLIPROXYAPI_API_KEY: "env-key",
     })).toEqual({ agentDir, baseUrl: "http://env:8317", apiKey: "env-key" });
+  });
+
+  test("places the full catalog under the OMP agent tmp directory", () => {
+    expect(modelsDevCachePath("/home/test/.omp/agent")).toBe("/home/test/.omp/agent/tmp/models.dev.json");
   });
 
   test("rejects malformed config fields", () => {
@@ -184,6 +188,7 @@ describe("metadata enrichment", () => {
   test("replaces an invalid cache and reuses the fresh catalog", async () => {
     const agentDir = temporaryAgentDir();
     const path = cacheFile(agentDir);
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, "{}");
     let requests = 0;
     const fetcher: FetchImpl = async () => {
@@ -192,8 +197,8 @@ describe("metadata enrichment", () => {
     };
 
     const identities = [{ id: "ocgo/deepseek-v4-flash", owner: "OpenCode Go" }];
-    const first = await loadModelsDevMetadata(identities, fetcher, path);
-    const second = await loadModelsDevMetadata(identities, fetcher, path);
+    const first = await loadModelsDevMetadata(identities, path, fetcher);
+    const second = await loadModelsDevMetadata(identities, path, fetcher);
 
     expect(first.get(identities[0].id)?.contextWindow).toBe(1_000_000);
     expect(second.get(identities[0].id)?.contextWindow).toBe(1_000_000);

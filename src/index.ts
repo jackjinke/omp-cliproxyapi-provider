@@ -26,7 +26,7 @@ function credentialBaseUrl(value: string): string | undefined {
 export function createProvider(
   settings: ResolvedSettings,
   fetcher: FetchImpl = fetch,
-  modelsDevCacheFile: string = modelsDevCachePath(),
+  modelsDevCacheFile: string = modelsDevCachePath(settings.agentDir),
 ): ProviderConfig {
   let activeBaseUrl = settings.baseUrl;
 
