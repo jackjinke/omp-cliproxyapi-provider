@@ -30,15 +30,16 @@ export CLIPROXYAPI_API_KEY=cpa-your-key
 Select a discovered model with `/model`, or reference it directly:
 
 ```text
-cliproxyapi/<model-id>
+cliproxyapi/gpt-5.6-sol
+cliproxyapi/claude-fable-5
 ```
 
 Example OMP role configuration:
 
 ```yaml
 modelRoles:
-  default: cliproxyapi/gpt-5.4:high
-  slow: cliproxyapi/gpt-5.4:xhigh
+  default: cliproxyapi/gpt-5.6-sol:high
+  slow: cliproxyapi/claude-fable-5:xhigh
 ```
 
 Refresh the dynamic model catalog with:
