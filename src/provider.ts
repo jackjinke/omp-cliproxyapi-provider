@@ -2,10 +2,12 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Effort } from "@oh-my-pi/pi-catalog";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import {
   type ExternalModelMetadata,
+  type ModelIdentity,
   loadModelsDevMetadata,
   modelsDevCachePath,
 } from "./models-dev.ts";
@@ -21,6 +23,24 @@ const FETCH_TIMEOUT_MS = 15_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 const SUPPORTED_EFFORTS = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const;
 type SupportedEffort = (typeof SUPPORTED_EFFORTS)[number];
+
+function bundledCodexMetadata(model: ModelIdentity): ExternalModelMetadata | undefined {
+  if (model.owner?.trim().toLowerCase() !== "openai") return undefined;
+  const reference = getBundledModel("openai-codex", model.id);
+  if (!reference) return undefined;
+  const efforts = reference.thinking?.mode === "effort"
+    ? reference.thinking.efforts.map(String)
+    : undefined;
+  return {
+    name: reference.name,
+    reasoning: reference.reasoning,
+    efforts,
+    input: [...reference.input],
+    contextWindow: reference.contextWindow ?? undefined,
+    maxTokens: reference.maxTokens ?? undefined,
+    cost: { ...reference.cost },
+  };
+}
 
 export interface CliproxyConfig {
   baseUrl?: string;
@@ -100,7 +120,6 @@ export function resolveSettings(
 export function resolveEndpoints(baseUrlInput: string): {
   inferenceBaseUrl: string;
   rawModelsUrl: string;
-  codexModelsUrl: string;
 } {
   let raw = baseUrlInput.trim();
   if (!raw) throw new Error("CLIProxyAPI base URL is empty");
@@ -121,7 +140,6 @@ export function resolveEndpoints(baseUrlInput: string): {
   return {
     inferenceBaseUrl: `${url.origin}${path}/`,
     rawModelsUrl,
-    codexModelsUrl: `${rawModelsUrl}?client_version=pi`,
   };
 }
 
@@ -205,27 +223,22 @@ export async function fetchModels(
   modelsDevCacheFile: string = modelsDevCachePath(agentDirectory()),
 ): Promise<ProviderModelConfig[]> {
   const endpoints = resolveEndpoints(baseUrl);
-  const [rawModels, codexModels] = await Promise.all([
-    fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher),
-    fetchCatalog(endpoints.codexModelsUrl, apiKey, fetcher),
-  ]);
+  const rawModels = await fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher);
 
   const identities = rawModels.flatMap(model => {
     const id = nonEmptyString(model.id);
     return id ? [{ id, owner: nonEmptyString(model.owned_by) }] : [];
   });
+  const identityById = new Map(identities.map(identity => [identity.id, identity]));
   const externalMetadata = await loadModelsDevMetadata(identities, modelsDevCacheFile, fetcher);
-  const codexById = new Map<string, JsonObject>();
-  for (const model of codexModels) {
-    const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);
-    if (id) codexById.set(id, model);
-  }
 
   return rawModels
     .map(rawModel => {
       const id = nonEmptyString(rawModel.id);
       if (!id) return null;
-      return mapCatalogModel(codexById.get(id) ?? rawModel, externalMetadata.get(id));
+      const identity = identityById.get(id);
+      const metadata = identity ? bundledCodexMetadata(identity) ?? externalMetadata.get(id) : externalMetadata.get(id);
+      return mapCatalogModel(rawModel, metadata);
     })
     .filter((model): model is ProviderModelConfig => model !== null);
 }

@@ -18,7 +18,6 @@ import {
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const CPA_ROOT = "http://llm.example:8317";
 const RAW_MODELS_URL = `${CPA_ROOT}/v1/models`;
-const CODEX_MODELS_URL = `${RAW_MODELS_URL}?client_version=pi`;
 
 const MODELS_DEV_FIXTURE = {
   "opencode-go": {
@@ -76,17 +75,14 @@ describe("endpoint resolution", () => {
     expect(resolveEndpoints("llm.example:8317")).toEqual({
       inferenceBaseUrl: "http://llm.example:8317/backend-api/",
       rawModelsUrl: "http://llm.example:8317/v1/models",
-      codexModelsUrl: "http://llm.example:8317/v1/models?client_version=pi",
     });
     expect(resolveEndpoints("https://llm.example/prefix/v1")).toEqual({
       inferenceBaseUrl: "https://llm.example/prefix/backend-api/",
       rawModelsUrl: "https://llm.example/prefix/v1/models",
-      codexModelsUrl: "https://llm.example/prefix/v1/models?client_version=pi",
     });
     expect(resolveEndpoints("https://llm.example/backend-api/")).toEqual({
       inferenceBaseUrl: "https://llm.example/backend-api/",
       rawModelsUrl: "https://llm.example/v1/models",
-      codexModelsUrl: "https://llm.example/v1/models?client_version=pi",
     });
   });
 });
@@ -115,7 +111,7 @@ describe("configuration", () => {
 });
 
 describe("metadata enrichment", () => {
-  test("maps CPA rich metadata without external enrichment", () => {
+  test("maps available catalog fields without external enrichment", () => {
     const model = mapCatalogModel({
       slug: "gpt-5.6-sol",
       display_name: "GPT 5.6 Sol",
@@ -138,15 +134,6 @@ describe("metadata enrichment", () => {
     const requests: RecordedRequest[] = [];
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: { data: [{ id: "ocgo/deepseek-v4-flash", owned_by: "OpenCode Go" }] },
-      [CODEX_MODELS_URL]: {
-        models: [{
-          slug: "ocgo/deepseek-v4-flash",
-          display_name: "deepseek-v4-flash",
-          context_window: 272_000,
-          input_modalities: ["text", "image"],
-          supported_reasoning_levels: ["low", "medium", "high"],
-        }],
-      },
       [MODELS_DEV_URL]: MODELS_DEV_FIXTURE,
     }, requests);
 
@@ -166,11 +153,58 @@ describe("metadata enrichment", () => {
     expect(requests.find(request => request.url === MODELS_DEV_URL)?.authorization).toBeNull();
   });
 
+  test("uses bundled Codex metadata for OpenAI-owned catalog models", async () => {
+    const agentDir = temporaryAgentDir();
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: { data: [{ id: "gpt-5.6-sol", owned_by: "OpenAI" }] },
+      [MODELS_DEV_URL]: {
+        openai: {
+          id: "openai",
+          name: "OpenAI",
+          models: {
+            "gpt-5.6-sol": {
+              id: "gpt-5.6-sol",
+              name: "Wrong models.dev metadata",
+              limit: { context: 1_050_000, output: 1_050_000 },
+            },
+          },
+        },
+      },
+    });
+
+    const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
+    expect(model).toMatchObject({
+      id: "gpt-5.6-sol",
+      name: "GPT-5.6 Sol",
+      contextWindow: 372_000,
+      maxTokens: 128_000,
+      input: ["text", "image"],
+    });
+    expect(Array.from(model?.thinking?.efforts ?? [], String)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("does not classify non-OpenAI owners as Codex", async () => {
+    const agentDir = temporaryAgentDir();
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: { data: [{ id: "gpt-5.6-sol", owned_by: "Gateway" }] },
+      [MODELS_DEV_URL]: {
+        gateway: {
+          id: "gateway",
+          name: "Gateway",
+          models: { "gpt-5.6-sol": { id: "gpt-5.6-sol", limit: { context: 900_000, output: 90_000 } } },
+        },
+      },
+    });
+
+    const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
+    expect(model?.contextWindow).toBe(900_000);
+    expect(model?.maxTokens).toBe(90_000);
+  });
+
   test("applies owned_by matching generically", async () => {
     const agentDir = temporaryAgentDir();
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: { data: [{ id: "gpt-test", owned_by: "OpenAI" }] },
-      [CODEX_MODELS_URL]: { models: [{ slug: "gpt-test", context_window: 200_000 }] },
       [MODELS_DEV_URL]: {
         openai: {
           id: "openai",
@@ -206,16 +240,16 @@ describe("metadata enrichment", () => {
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(MODELS_DEV_FIXTURE);
   });
 
-  test("falls back to CPA rich metadata when models.dev is unavailable", async () => {
+  test("uses conservative defaults when models.dev is unavailable", async () => {
     const agentDir = temporaryAgentDir();
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: { data: [{ id: "unknown", owned_by: "Unknown" }] },
-      [CODEX_MODELS_URL]: { models: [{ slug: "unknown", context_window: 300_000 }] },
       [MODELS_DEV_URL]: new Response("offline", { status: 503 }),
     });
 
     const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
-    expect(model?.contextWindow).toBe(300_000);
+    expect(model?.contextWindow).toBe(128_000);
+    expect(model?.maxTokens).toBe(16_384);
   });
 
   test("skips hidden and unusable catalog entries", () => {
@@ -227,7 +261,6 @@ describe("metadata enrichment", () => {
     const agentDir = temporaryAgentDir();
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: new Response("denied", { status: 401 }),
-      [CODEX_MODELS_URL]: { models: [] },
     });
     await expect(fetchModels(CPA_ROOT, "bad", fetcher, cacheFile(agentDir))).rejects.toThrow("HTTP 401: denied");
   });
@@ -238,7 +271,6 @@ describe("native OMP provider", () => {
     const agentDir = temporaryAgentDir();
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: { data: [{ id: "gpt-test", owned_by: "test" }] },
-      [CODEX_MODELS_URL]: { models: [{ slug: "gpt-test" }] },
       [MODELS_DEV_URL]: {},
     });
     const provider = createProvider(
@@ -257,15 +289,11 @@ describe("native OMP provider", () => {
   test("login validates, persists, and updates the active endpoint", async () => {
     const agentDir = temporaryAgentDir();
     const oldRaw = "http://old.example:8317/v1/models";
-    const oldCodex = `${oldRaw}?client_version=pi`;
     const newRaw = "http://new.example:8317/v1/models";
-    const newCodex = `${newRaw}?client_version=pi`;
     const requests: RecordedRequest[] = [];
     const fetcher = routeFetcher({
       [oldRaw]: { data: [] },
-      [oldCodex]: { models: [] },
       [newRaw]: { data: [] },
-      [newCodex]: { models: [] },
       [MODELS_DEV_URL]: {},
     }, requests);
     const provider = createProvider(
@@ -290,7 +318,6 @@ describe("native OMP provider", () => {
 
     await provider.fetchDynamicModels?.("new-key");
     expect(requests.filter(request => request.url === newRaw)).toHaveLength(2);
-    expect(requests.filter(request => request.url === newCodex)).toHaveLength(2);
 
     const fakeModels: Model[] = [
       { provider: PROVIDER_ID, id: "gpt-test", baseUrl: "http://old/backend-api/" },
