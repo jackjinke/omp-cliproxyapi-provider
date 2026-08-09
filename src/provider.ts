@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { Effort } from "@oh-my-pi/pi-catalog";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
+import type { RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import {
   type ExternalModelMetadata,
@@ -27,7 +28,16 @@ const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 const SUPPORTED_EFFORTS = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const;
 type SupportedEffort = (typeof SUPPORTED_EFFORTS)[number];
 
-function bundledCodexMetadata(model: ModelIdentity): ExternalModelMetadata | undefined {
+export type CliproxyProviderModelConfig = ProviderModelConfig & {
+  remoteCompaction?: RemoteCompactionConfig;
+};
+
+interface BundledCodexModelMetadata {
+  metadata: ExternalModelMetadata;
+  remoteCompaction?: RemoteCompactionConfig;
+}
+
+function bundledCodexModelMetadata(model: ModelIdentity): BundledCodexModelMetadata | undefined {
   if (model.owner?.trim().toLowerCase() !== "openai") return undefined;
   const reference = getBundledModel("openai-codex", model.id);
   if (!reference) return undefined;
@@ -35,13 +45,16 @@ function bundledCodexMetadata(model: ModelIdentity): ExternalModelMetadata | und
     ? reference.thinking.efforts.map(String)
     : undefined;
   return {
-    name: reference.name,
-    reasoning: reference.reasoning,
-    efforts,
-    input: [...reference.input],
-    contextWindow: reference.contextWindow ?? undefined,
-    maxTokens: reference.maxTokens ?? undefined,
-    cost: { ...reference.cost },
+    metadata: {
+      name: reference.name,
+      reasoning: reference.reasoning,
+      efforts,
+      input: [...reference.input],
+      contextWindow: reference.contextWindow ?? undefined,
+      maxTokens: reference.maxTokens ?? undefined,
+      cost: { ...reference.cost },
+    },
+    ...(reference.remoteCompaction ? { remoteCompaction: { ...reference.remoteCompaction } } : {}),
   };
 }
 
@@ -186,7 +199,8 @@ function inputModalities(model: JsonObject): Array<"text" | "image"> {
 export function mapCatalogModel(
   model: JsonObject,
   metadata?: ExternalModelMetadata,
-): ProviderModelConfig | null {
+  remoteCompaction?: RemoteCompactionConfig,
+): CliproxyProviderModelConfig | null {
   const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);
   if (!id || nonEmptyString(model.visibility)?.toLowerCase() === "hide") return null;
 
@@ -209,6 +223,7 @@ export function mapCatalogModel(
     contextWindow: metadata?.contextWindow
       ?? positiveInteger(model.context_window, positiveInteger(model.max_context_window, 128_000)),
     maxTokens: metadata?.maxTokens ?? 16_384,
+    ...(remoteCompaction ? { remoteCompaction } : {}),
   };
 }
 
@@ -234,7 +249,7 @@ export async function fetchModels(
   fetcher: FetchImpl = fetch,
   modelsDevCacheFile: string = modelsDevCachePath(agentDirectory()),
   userMetadataOverrides: readonly ModelMetadataOverride[] = [],
-): Promise<ProviderModelConfig[]> {
+): Promise<CliproxyProviderModelConfig[]> {
   const endpoints = resolveEndpoints(baseUrl);
   const rawModels = await fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher);
   const identities = rawModels.flatMap(model => {
@@ -254,12 +269,13 @@ export async function fetchModels(
       const id = nonEmptyString(rawModel.id);
       if (!id) return null;
       const identity = identityById.get(id);
+      const codexMetadata = identity ? bundledCodexModelMetadata(identity) : undefined;
       const metadata = identity
         ? metadataMatches.overridden.get(id)
-          ?? bundledCodexMetadata(identity)
+          ?? codexMetadata?.metadata
           ?? metadataMatches.automatic.get(id)
         : undefined;
-      return mapCatalogModel(rawModel, metadata);
+      return mapCatalogModel(rawModel, metadata, codexMetadata?.remoteCompaction);
     })
-    .filter((model): model is ProviderModelConfig => model !== null);
+    .filter((model): model is CliproxyProviderModelConfig => model !== null);
 }

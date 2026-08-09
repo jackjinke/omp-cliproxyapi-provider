@@ -2,7 +2,7 @@
 
 Native [OMP](https://github.com/can1357/oh-my-pi) provider extension for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 
-It discovers available models from CLIProxyAPI's raw model endpoint and registers them under the `cliproxyapi` provider using OMP's native `openai-codex-responses` transport. OMP's bundled Codex catalog and models.dev enrich raw model identities; configurable metadata mappings handle aliases that use different catalog names.
+It discovers available models from CLIProxyAPI's raw model endpoint and registers them under the `cliproxyapi` provider using OMP's native `openai-codex-responses` transport. OMP's bundled Codex catalog and models.dev enrich raw model identities; configurable metadata mappings handle aliases that use different catalog names. Exact OpenAI-owned Codex matches also retain OMP's bundled remote-compaction capabilities.
 
 ## Install
 

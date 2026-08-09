@@ -225,8 +225,42 @@ describe("metadata enrichment", () => {
       contextWindow: 372_000,
       maxTokens: 128_000,
       input: ["text", "image"],
+      remoteCompaction: {
+        enabled: true,
+        api: "openai-codex-responses",
+        v2StreamingEnabled: true,
+      },
     });
     expect(Array.from(model?.thinking?.efforts ?? [], String)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("preserves Codex compaction metadata through a user metadata mapping", async () => {
+    const agentDir = temporaryAgentDir();
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: { data: [{ id: "gpt-5.6-sol", owned_by: "OpenAI" }] },
+      [MODELS_DEV_URL]: {
+        custom: {
+          id: "custom",
+          models: {
+            sol: { id: "sol", name: "Custom Sol", limit: { context: 300_000, output: 90_000 } },
+          },
+        },
+      },
+    });
+
+    const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir), [{
+      modelId: "gpt-5.6-sol",
+      overrideWith: "custom/sol",
+    }]);
+    expect(model).toMatchObject({
+      name: "Custom Sol",
+      contextWindow: 300_000,
+      remoteCompaction: {
+        enabled: true,
+        api: "openai-codex-responses",
+        v2StreamingEnabled: true,
+      },
+    });
   });
 
   test("does not classify non-OpenAI owners as Codex", async () => {
@@ -245,6 +279,7 @@ describe("metadata enrichment", () => {
     const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
     expect(model?.contextWindow).toBe(900_000);
     expect(model?.maxTokens).toBe(90_000);
+    expect(model?.remoteCompaction).toBeUndefined();
   });
 
   test("applies owned_by matching generically", async () => {
