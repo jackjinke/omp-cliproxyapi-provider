@@ -53,7 +53,7 @@ export function createProvider(
         if (!apiKey) throw new Error("CLIProxyAPI API key cannot be empty");
 
         callbacks.onProgress?.("Validating CLIProxyAPI credentials...");
-        await fetchModels(baseUrl, apiKey, fetcher, modelsDevCacheFile);
+        await fetchModels(baseUrl, apiKey, fetcher, modelsDevCacheFile, settings.modelMetadataOverrides);
         writeConfig(settings.agentDir, { baseUrl, apiKey });
         activeBaseUrl = baseUrl;
         return {
@@ -76,8 +76,10 @@ export function createProvider(
       },
     },
     fetchDynamicModels(apiKey: string | undefined) {
-      return apiKey ? fetchModels(activeBaseUrl, apiKey, fetcher, modelsDevCacheFile) : Promise.resolve([]);
-    },
+      return apiKey
+        ? fetchModels(activeBaseUrl, apiKey, fetcher, modelsDevCacheFile, settings.modelMetadataOverrides)
+        : Promise.resolve([]);
+    }
   };
 }
 

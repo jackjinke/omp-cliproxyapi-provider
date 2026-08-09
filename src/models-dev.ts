@@ -21,6 +21,18 @@ export interface ExternalModelMetadata {
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
+export interface ModelMetadataOverride {
+  modelId: string;
+  overrideWith: string;
+  contextWindow?: number;
+  displayName?: string;
+}
+
+export interface ModelsDevMetadataMatches {
+  automatic: Map<string, ExternalModelMetadata>;
+  overridden: Map<string, ExternalModelMetadata>;
+}
+
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -32,6 +44,66 @@ function positiveNumber(value: unknown): number | undefined {
 
 function providerKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+export function parseModelMetadataOverrides(
+  value: unknown,
+  fieldName = "modelMetadataOverrides",
+): ModelMetadataOverride[] {
+  if (!Array.isArray(value)) throw new Error(`${fieldName} must be an array`);
+
+  const seen = new Set<string>();
+  return value.map((entry, index) => {
+    const entryName = `${fieldName}[${index}]`;
+    if (!isJsonObject(entry)) throw new Error(`${entryName} must be an object`);
+    const unsupported = Object.keys(entry).filter(
+      key => !["modelId", "overrideWith", "contextWindow", "displayName"].includes(key),
+    );
+    if (unsupported.length > 0) throw new Error(`${entryName} contains unsupported field "${unsupported[0]}"`);
+
+    const modelId = stringValue(entry.modelId);
+    if (!modelId) throw new Error(`${entryName}.modelId must be a non-empty string`);
+    if (seen.has(modelId)) throw new Error(`${fieldName} contains duplicate modelId "${modelId}"`);
+    seen.add(modelId);
+
+    const overrideWith = stringValue(entry.overrideWith);
+    const separator = overrideWith?.indexOf("/") ?? -1;
+    if (!overrideWith || separator <= 0 || separator === overrideWith.length - 1) {
+      throw new Error(`${entryName}.overrideWith must use "provider/model" format`);
+    }
+
+    const contextWindow = entry.contextWindow;
+    if (
+      contextWindow !== undefined
+      && (typeof contextWindow !== "number" || !Number.isInteger(contextWindow) || contextWindow <= 0)
+    ) {
+      throw new Error(`${entryName}.contextWindow must be a positive integer`);
+    }
+    const displayName = entry.displayName === undefined ? undefined : stringValue(entry.displayName);
+    if (entry.displayName !== undefined && !displayName) {
+      throw new Error(`${entryName}.displayName must be a non-empty string`);
+    }
+
+    return {
+      modelId,
+      overrideWith,
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(displayName ? { displayName } : {}),
+    };
+  });
+}
+
+export const DEFAULT_MODEL_METADATA_OVERRIDES = parseModelMetadataOverrides(
+  JSON.parse(readFileSync(new URL("./model-metadata-overrides.json", import.meta.url), "utf8")),
+  "default model metadata overrides",
+);
+
+export function mergeModelMetadataOverrides(
+  userOverrides: readonly ModelMetadataOverride[] = [],
+): ModelMetadataOverride[] {
+  const merged = new Map(DEFAULT_MODEL_METADATA_OVERRIDES.map(override => [override.modelId, override]));
+  for (const override of userOverrides) merged.set(override.modelId, override);
+  return [...merged.values()];
 }
 
 export function modelsDevCachePath(agentDir: string): string {
@@ -158,18 +230,34 @@ export async function loadModelsDevMetadata(
   models: readonly ModelIdentity[],
   cacheFile: string,
   fetcher: FetchImpl = fetch,
-): Promise<Map<string, ExternalModelMetadata>> {
+  overrides: readonly ModelMetadataOverride[] = DEFAULT_MODEL_METADATA_OVERRIDES,
+): Promise<ModelsDevMetadataMatches> {
+  const automatic = new Map<string, ExternalModelMetadata>();
+  const overridden = new Map<string, ExternalModelMetadata>();
   const catalog = await loadCatalog(fetcher, cacheFile);
-  if (!catalog) return new Map();
+  if (!catalog) return { automatic, overridden };
 
   const providers = providerModels(catalog);
-  const metadata = new Map<string, ExternalModelMetadata>();
+  const overridesByModel = new Map(overrides.map(override => [override.modelId, override]));
   for (const model of models) {
-    if (!model.owner) continue;
-    const provider = providers.get(providerKey(model.owner));
-    if (!provider) continue;
-    const match = findProviderModel(provider, model.id);
-    if (match) metadata.set(model.id, normalizeMetadata(match));
+    if (model.owner) {
+      const provider = providers.get(providerKey(model.owner));
+      const match = provider ? findProviderModel(provider, model.id) : undefined;
+      if (match) automatic.set(model.id, normalizeMetadata(match));
+    }
+
+    const override = overridesByModel.get(model.id);
+    if (!override) continue;
+    const separator = override.overrideWith.indexOf("/");
+    const provider = providers.get(providerKey(override.overrideWith.slice(0, separator)));
+    const match = provider ? findProviderModel(provider, override.overrideWith.slice(separator + 1)) : undefined;
+    if (!match) continue;
+    const metadata = normalizeMetadata(match);
+    overridden.set(model.id, {
+      ...metadata,
+      ...(override.contextWindow !== undefined ? { contextWindow: override.contextWindow } : {}),
+      ...(override.displayName !== undefined ? { name: override.displayName } : {}),
+    });
   }
-  return metadata;
+  return { automatic, overridden };
 }

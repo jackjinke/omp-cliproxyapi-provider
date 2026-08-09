@@ -18,7 +18,6 @@ import {
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const CPA_ROOT = "http://llm.example:8317";
 const RAW_MODELS_URL = `${CPA_ROOT}/v1/models`;
-const RICH_MODELS_URL = `${RAW_MODELS_URL}?client_version=pi`;
 
 const MODELS_DEV_FIXTURE = {
   "opencode-go": {
@@ -34,6 +33,21 @@ const MODELS_DEV_FIXTURE = {
         modalities: { input: ["text"], output: ["text"] },
         limit: { context: 1_000_000, output: 384_000 },
         cost: { input: 0.07, output: 0.14, cache_read: 0.0014 },
+      },
+    },
+  },
+  moonshotai: {
+    id: "moonshotai",
+    name: "Moonshot AI",
+    models: {
+      "kimi-k3": {
+        id: "kimi-k3",
+        name: "Kimi K3",
+        reasoning: true,
+        reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
+        modalities: { input: ["text", "image", "video"], output: ["text"] },
+        limit: { context: 1_048_576, output: 131_072 },
+        cost: { input: 3, output: 15, cache_read: 0.3 },
       },
     },
   },
@@ -76,23 +90,20 @@ describe("endpoint resolution", () => {
     expect(resolveEndpoints("llm.example:8317")).toEqual({
       inferenceBaseUrl: "http://llm.example:8317/backend-api/",
       rawModelsUrl: "http://llm.example:8317/v1/models",
-      richModelsUrl: "http://llm.example:8317/v1/models?client_version=pi",
     });
     expect(resolveEndpoints("https://llm.example/prefix/v1")).toEqual({
       inferenceBaseUrl: "https://llm.example/prefix/backend-api/",
       rawModelsUrl: "https://llm.example/prefix/v1/models",
-      richModelsUrl: "https://llm.example/prefix/v1/models?client_version=pi",
     });
     expect(resolveEndpoints("https://llm.example/backend-api/")).toEqual({
       inferenceBaseUrl: "https://llm.example/backend-api/",
       rawModelsUrl: "https://llm.example/v1/models",
-      richModelsUrl: "https://llm.example/v1/models?client_version=pi",
     });
   });
 });
 
 describe("configuration", () => {
-  test("resolves environment over the existing config file", () => {
+  test("resolves the config file before the default environment variable", () => {
     const agentDir = temporaryAgentDir();
     writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify({ baseUrl: "http://file:8317", apiKey: "file-key" }));
 
@@ -100,7 +111,15 @@ describe("configuration", () => {
       PI_CODING_AGENT_DIR: agentDir,
       CLIPROXYAPI_BASE_URL: "http://env:8317",
       CLIPROXYAPI_API_KEY: "env-key",
-    })).toEqual({ agentDir, baseUrl: "http://env:8317", apiKey: "env-key" });
+    })).toEqual({ agentDir, baseUrl: "http://env:8317", apiKey: "file-key" });
+  });
+
+  test("falls back to the default API key environment variable", () => {
+    const agentDir = temporaryAgentDir();
+    expect(resolveSettings({
+      PI_CODING_AGENT_DIR: agentDir,
+      CLIPROXYAPI_API_KEY: "env-key",
+    })).toEqual({ agentDir, baseUrl: "http://127.0.0.1:8317", apiKey: "env-key" });
   });
 
   test("places the full catalog under the OMP agent tmp directory", () => {
@@ -111,6 +130,29 @@ describe("configuration", () => {
     const agentDir = temporaryAgentDir();
     writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify({ baseUrl: 8317 }));
     expect(() => readConfig(agentDir)).toThrow('field "baseUrl" must be a non-empty string');
+  });
+
+  test("validates user metadata overrides", () => {
+    const agentDir = temporaryAgentDir();
+    writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify({
+      modelMetadataOverrides: [{
+        modelId: "kimi-k3-256k",
+        overrideWith: "kimi-for-coding/k3-256k",
+        contextWindow: 200_000,
+        displayName: "Private K3",
+      }],
+    }));
+    expect(readConfig(agentDir).modelMetadataOverrides).toEqual([{
+      modelId: "kimi-k3-256k",
+      overrideWith: "kimi-for-coding/k3-256k",
+      contextWindow: 200_000,
+      displayName: "Private K3",
+    }]);
+
+    writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify({
+      modelMetadataOverrides: [{ modelId: "kimi-k3", overrideWith: "missing-provider" }],
+    }));
+    expect(() => readConfig(agentDir)).toThrow('overrideWith must use "provider/model" format');
   });
 });
 
@@ -223,7 +265,7 @@ describe("metadata enrichment", () => {
     expect(model?.maxTokens).toBe(90_000);
   });
 
-  test("uses rich CPA metadata when a native owner has no models.dev match", async () => {
+  test("uses built-in K3 mappings and local metadata overrides", async () => {
     const agentDir = temporaryAgentDir();
     const requests: RecordedRequest[] = [];
     const fetcher = routeFetcher({
@@ -233,25 +275,7 @@ describe("metadata enrichment", () => {
           { id: "kimi-k3-256k", owned_by: "moonshot" },
         ],
       },
-      [RICH_MODELS_URL]: {
-        models: [
-          {
-            slug: "kimi-k3",
-            display_name: "Kimi K3",
-            context_window: 1_048_576,
-            input_modalities: ["text", "image"],
-            supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }, { effort: "max" }],
-          },
-          {
-            slug: "kimi-k3-256k",
-            display_name: "Kimi K3 256K",
-            context_window: 262_144,
-            input_modalities: ["text", "image"],
-            supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }, { effort: "max" }],
-          },
-        ],
-      },
-      [MODELS_DEV_URL]: {},
+      [MODELS_DEV_URL]: MODELS_DEV_FIXTURE,
     }, requests);
 
     const models = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
@@ -260,36 +284,64 @@ describe("metadata enrichment", () => {
         id: "kimi-k3",
         name: "Kimi K3",
         contextWindow: 1_048_576,
-        maxTokens: 128_000,
+        maxTokens: 131_072,
         reasoning: true,
         input: ["text", "image"],
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
       },
       {
         id: "kimi-k3-256k",
         name: "Kimi K3 256K",
         contextWindow: 262_144,
-        maxTokens: 128_000,
+        maxTokens: 131_072,
         reasoning: true,
         input: ["text", "image"],
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
       },
     ]);
     expect(Array.from(models[0]?.thinking?.efforts ?? [], String)).toEqual(["low", "high", "max"]);
-    expect(requests.filter(request => request.url === RAW_MODELS_URL || request.url === RICH_MODELS_URL))
-      .toHaveLength(2);
+    expect(Array.from(models[1]?.thinking?.efforts ?? [], String)).toEqual(["low", "high", "max"]);
+    expect(requests.filter(request => request.url.startsWith(CPA_ROOT))).toHaveLength(1);
   });
 
-  test("prefers models.dev over rich metadata for exact owner matches", async () => {
+  test("uses a user mapping before the built-in mapping", async () => {
+    const agentDir = temporaryAgentDir();
+    const fetcher = routeFetcher({
+      [RAW_MODELS_URL]: { data: [{ id: "kimi-k3-256k", owned_by: "moonshot" }] },
+      [MODELS_DEV_URL]: {
+        ...MODELS_DEV_FIXTURE,
+        custom: {
+          id: "custom",
+          name: "Custom",
+          models: {
+            k3: {
+              id: "k3",
+              name: "Catalog K3",
+              limit: { context: 300_000, output: 90_000 },
+            },
+          },
+        },
+      },
+    });
+
+    const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir), [{
+      modelId: "kimi-k3-256k",
+      overrideWith: "custom/k3",
+      contextWindow: 200_000,
+      displayName: "User K3",
+    }]);
+    expect(model).toMatchObject({
+      id: "kimi-k3-256k",
+      name: "User K3",
+      contextWindow: 200_000,
+      maxTokens: 90_000,
+    });
+  });
+
+  test("normalizes models.dev provider ownership", async () => {
     const agentDir = temporaryAgentDir();
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: { data: [{ id: "grok-4.5", owned_by: "xai" }] },
-      [RICH_MODELS_URL]: {
-        models: [{
-          slug: "grok-4.5",
-          display_name: "Wrong rich metadata",
-          context_window: 272_000,
-          supported_reasoning_levels: [{ effort: "medium" }],
-        }],
-      },
       [MODELS_DEV_URL]: {
         "x-ai": {
           id: "x-ai",
@@ -317,20 +369,13 @@ describe("metadata enrichment", () => {
     });
   });
 
-  test("ignores rich metadata for unknown compatibility owners", async () => {
+  test("uses conservative defaults without a mapping or exact owner match", async () => {
     const agentDir = temporaryAgentDir();
+    const requests: RecordedRequest[] = [];
     const fetcher = routeFetcher({
       [RAW_MODELS_URL]: { data: [{ id: "unknown", owned_by: "Gateway" }] },
-      [RICH_MODELS_URL]: {
-        models: [{
-          slug: "unknown",
-          display_name: "Synthesized metadata",
-          context_window: 272_000,
-          supported_reasoning_levels: [{ effort: "medium" }],
-        }],
-      },
       [MODELS_DEV_URL]: {},
-    });
+    }, requests);
 
     const [model] = await fetchModels(CPA_ROOT, "secret", fetcher, cacheFile(agentDir));
     expect(model).toMatchObject({
@@ -339,6 +384,7 @@ describe("metadata enrichment", () => {
       maxTokens: 16_384,
       reasoning: false,
     });
+    expect(requests.filter(request => request.url.startsWith(CPA_ROOT))).toHaveLength(1);
   });
 
   test("replaces an invalid cache and reuses the fresh catalog", async () => {
@@ -356,8 +402,8 @@ describe("metadata enrichment", () => {
     const first = await loadModelsDevMetadata(identities, path, fetcher);
     const second = await loadModelsDevMetadata(identities, path, fetcher);
 
-    expect(first.get(identities[0].id)?.contextWindow).toBe(1_000_000);
-    expect(second.get(identities[0].id)?.contextWindow).toBe(1_000_000);
+    expect(first.automatic.get(identities[0].id)?.contextWindow).toBe(1_000_000);
+    expect(second.automatic.get(identities[0].id)?.contextWindow).toBe(1_000_000);
     expect(requests).toBe(1);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(MODELS_DEV_FIXTURE);
   });

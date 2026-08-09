@@ -1,0 +1,12 @@
+[
+  {
+    "modelId": "kimi-k3",
+    "overrideWith": "moonshotai/kimi-k3"
+  },
+  {
+    "modelId": "kimi-k3-256k",
+    "overrideWith": "moonshotai/kimi-k3",
+    "contextWindow": 262144,
+    "displayName": "Kimi K3 256K"
+  }
+]

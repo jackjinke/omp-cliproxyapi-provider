@@ -8,8 +8,11 @@ import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import {
   type ExternalModelMetadata,
   type ModelIdentity,
+  type ModelMetadataOverride,
   loadModelsDevMetadata,
+  mergeModelMetadataOverrides,
   modelsDevCachePath,
+  parseModelMetadataOverrides,
 } from "./models-dev.ts";
 import { isJsonObject, type JsonObject } from "./type-guards.ts";
 
@@ -22,14 +25,6 @@ export const CREDENTIAL_TTL_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 const SUPPORTED_EFFORTS = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max] as const;
-const RICH_CATALOG_MAX_TOKENS = 128_000;
-const CPA_NATIVE_OWNERS: Record<string, true> = {
-  anthropic: true,
-  google: true,
-  moonshot: true,
-  openai: true,
-  xai: true,
-};
 type SupportedEffort = (typeof SUPPORTED_EFFORTS)[number];
 
 function bundledCodexMetadata(model: ModelIdentity): ExternalModelMetadata | undefined {
@@ -53,6 +48,7 @@ function bundledCodexMetadata(model: ModelIdentity): ExternalModelMetadata | und
 export interface CliproxyConfig {
   baseUrl?: string;
   apiKey?: string;
+  modelMetadataOverrides?: ModelMetadataOverride[];
   [key: string]: unknown;
 }
 
@@ -60,6 +56,7 @@ export interface ResolvedSettings {
   agentDir: string;
   baseUrl: string;
   apiKey?: string;
+  modelMetadataOverrides?: ModelMetadataOverride[];
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -87,16 +84,21 @@ export function readConfig(agentDir: string): CliproxyConfig {
     const record = Object.fromEntries(Object.entries(parsed));
     const baseUrl = record.baseUrl;
     const apiKey = record.apiKey;
+    const rawMetadataOverrides = record.modelMetadataOverrides;
     if (baseUrl !== undefined && nonEmptyString(baseUrl) === undefined) {
       throw new Error(`${CONFIG_FILE_NAME} field "baseUrl" must be a non-empty string`);
     }
     if (apiKey !== undefined && nonEmptyString(apiKey) === undefined) {
       throw new Error(`${CONFIG_FILE_NAME} field "apiKey" must be a non-empty string`);
     }
+    const modelMetadataOverrides = rawMetadataOverrides === undefined
+      ? undefined
+      : parseModelMetadataOverrides(rawMetadataOverrides, `${CONFIG_FILE_NAME} field "modelMetadataOverrides"`);
     return {
       ...record,
       ...(typeof baseUrl === "string" ? { baseUrl } : {}),
       ...(typeof apiKey === "string" ? { apiKey } : {}),
+      ...(modelMetadataOverrides !== undefined ? { modelMetadataOverrides } : {}),
     };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
@@ -121,14 +123,14 @@ export function resolveSettings(
   return {
     agentDir,
     baseUrl: nonEmptyString(environment.CLIPROXYAPI_BASE_URL) ?? nonEmptyString(config.baseUrl) ?? DEFAULT_BASE_URL,
-    apiKey: nonEmptyString(environment.CLIPROXYAPI_API_KEY) ?? nonEmptyString(config.apiKey),
+    apiKey: nonEmptyString(config.apiKey) ?? nonEmptyString(environment.CLIPROXYAPI_API_KEY),
+    ...(config.modelMetadataOverrides ? { modelMetadataOverrides: config.modelMetadataOverrides } : {}),
   };
 }
 
 export function resolveEndpoints(baseUrlInput: string): {
   inferenceBaseUrl: string;
   rawModelsUrl: string;
-  richModelsUrl: string;
 } {
   let raw = baseUrlInput.trim();
   if (!raw) throw new Error("CLIProxyAPI base URL is empty");
@@ -149,7 +151,6 @@ export function resolveEndpoints(baseUrlInput: string): {
   return {
     inferenceBaseUrl: `${url.origin}${path}/`,
     rawModelsUrl,
-    richModelsUrl: `${rawModelsUrl}?client_version=pi`,
   };
 }
 
@@ -181,30 +182,6 @@ function inputModalities(model: JsonObject): Array<"text" | "image"> {
   return hasImage ? ["text", "image"] : ["text"];
 }
 
-function richCatalogMetadata(model: JsonObject): ExternalModelMetadata {
-  const efforts = reasoningEfforts(model);
-  return {
-    name: nonEmptyString(model.display_name) ?? nonEmptyString(model.name),
-    reasoning: efforts.length > 0,
-    efforts,
-    input: inputModalities(model),
-    contextWindow: positiveInteger(model.context_window, positiveInteger(model.max_context_window, 128_000)),
-    // CPA's Codex-client response omits output limits; match OMP's native Codex discovery default.
-    maxTokens: RICH_CATALOG_MAX_TOKENS,
-  };
-}
-
-function nativeRichMetadata(
-  identity: ModelIdentity,
-  richModelsById: ReadonlyMap<string, JsonObject>,
-): ExternalModelMetadata | undefined {
-  if (
-    !identity.owner
-    || CPA_NATIVE_OWNERS[identity.owner.toLowerCase().replace(/[^a-z0-9]+/g, "")] !== true
-  ) return undefined;
-  const richModel = richModelsById.get(identity.id);
-  return richModel ? richCatalogMetadata(richModel) : undefined;
-}
 
 export function mapCatalogModel(
   model: JsonObject,
@@ -256,23 +233,21 @@ export async function fetchModels(
   apiKey: string,
   fetcher: FetchImpl = fetch,
   modelsDevCacheFile: string = modelsDevCachePath(agentDirectory()),
+  userMetadataOverrides: readonly ModelMetadataOverride[] = [],
 ): Promise<ProviderModelConfig[]> {
   const endpoints = resolveEndpoints(baseUrl);
-  const [rawModels, richModels] = await Promise.all([
-    fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher),
-    fetchCatalog(endpoints.richModelsUrl, apiKey, fetcher).catch(() => []),
-  ]);
-
+  const rawModels = await fetchCatalog(endpoints.rawModelsUrl, apiKey, fetcher);
   const identities = rawModels.flatMap(model => {
     const id = nonEmptyString(model.id);
     return id ? [{ id, owner: nonEmptyString(model.owned_by) }] : [];
   });
   const identityById = new Map(identities.map(identity => [identity.id, identity]));
-  const richModelsById = new Map(richModels.flatMap(model => {
-    const id = nonEmptyString(model.slug) ?? nonEmptyString(model.id);
-    return id ? [[id, model] as const] : [];
-  }));
-  const externalMetadata = await loadModelsDevMetadata(identities, modelsDevCacheFile, fetcher);
+  const metadataMatches = await loadModelsDevMetadata(
+    identities,
+    modelsDevCacheFile,
+    fetcher,
+    mergeModelMetadataOverrides(userMetadataOverrides),
+  );
 
   return rawModels
     .map(rawModel => {
@@ -280,10 +255,10 @@ export async function fetchModels(
       if (!id) return null;
       const identity = identityById.get(id);
       const metadata = identity
-        ? bundledCodexMetadata(identity)
-          ?? externalMetadata.get(id)
-          ?? nativeRichMetadata(identity, richModelsById)
-        : externalMetadata.get(id);
+        ? metadataMatches.overridden.get(id)
+          ?? bundledCodexMetadata(identity)
+          ?? metadataMatches.automatic.get(id)
+        : undefined;
       return mapCatalogModel(rawModel, metadata);
     })
     .filter((model): model is ProviderModelConfig => model !== null);

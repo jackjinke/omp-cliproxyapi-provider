@@ -1,6 +1,6 @@
 {
   "name": "omp-cliproxyapi-provider",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Native OMP provider extension for CLIProxyAPI",
   "type": "module",
   "license": "MIT",
