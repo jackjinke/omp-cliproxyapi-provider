@@ -1,0 +1,42 @@
+{
+  "name": "omp-cliproxyapi-provider",
+  "version": "0.1.0",
+  "description": "Native OMP provider extension for CLIProxyAPI",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jackjinke/omp-cliproxyapi-provider.git"
+  },
+  "keywords": [
+    "omp-plugin",
+    "oh-my-pi",
+    "cliproxyapi"
+  ],
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-ai": ">=17.2.0",
+    "@oh-my-pi/pi-catalog": ">=17.2.0",
+    "@oh-my-pi/pi-coding-agent": ">=17.2.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-ai": "17.2.11",
+    "@oh-my-pi/pi-catalog": "17.2.11",
+    "@oh-my-pi/pi-coding-agent": "17.2.11",
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.3"
+  }
+}
