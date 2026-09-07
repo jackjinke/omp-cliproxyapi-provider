@@ -347,7 +347,7 @@ describe("OMP adapter", () => {
 
     expect(host.providers).toHaveLength(1);
     const provider = host.providers[0];
-    expect(provider.name).toBe("cpa");
+    expect(provider.name).toBe("cliproxyapi");
     expect(provider.config.name).toBe("CLIProxyAPI");
     expect(provider.config.baseUrl).toBe("http://127.0.0.1:8317/v1");
     expect(provider.config.apiKey).toBe("abc");
@@ -408,7 +408,7 @@ describe("OMP adapter", () => {
     await activateOmp(host, environment, async () =>
       makeModelsResponse([KIMI_ENTRY, CLAUDE_ENTRY]),
     );
-    const provisional: FakeContextModel = { provider: "cpa", id: "kimi-k3-256k" };
+    const provisional: FakeContextModel = { provider: "cliproxyapi", id: "kimi-k3-256k" };
     await host.emit("session_start", fakeContext(provisional));
     expect(provisional.contextWindow).toBe(262144);
     expect(host.setModelCalls).toHaveLength(1);
@@ -422,7 +422,7 @@ describe("OMP adapter", () => {
     // from another provider (observed: omniroute's codex baseUrl survives
     // startup resolution and would hijack the request away from CPA).
     const provisional: FakeContextModel = {
-      provider: "cpa",
+      provider: "cliproxyapi",
       id: "gpt-5.3-codex",
       baseUrl: "http://or.sorcery.link:20128/v1/responses?omniroute-codex=",
     };
@@ -437,7 +437,7 @@ describe("OMP adapter", () => {
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
     await activateOmp(host, environment, async () => makeModelsResponse([KIMI_ENTRY]));
     const provisional: FakeContextModel = {
-      provider: "cpa",
+      provider: "cliproxyapi",
       id: "kimi-k3-256k",
       baseUrl: "http://or.sorcery.link:20128/v1",
     };

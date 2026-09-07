@@ -56,6 +56,8 @@ function codexBaseUrl(baseUrl: string): string {
  */
 const GENERIC_API = "openai-completions";
 
+const PROVIDER_NAME = "cliproxyapi";
+
 function buildOmpModels(models: CPAModel[], config: CPAConfig): OmpProviderModel[] {
   return models.map((model) => {
     if (model.isClaude) {
@@ -115,7 +117,7 @@ export async function activateOmp(
   const ompModels = buildOmpModels(catalog.models, config);
   const modelCache = new Map<string, OmpProviderModel>(ompModels.map((model) => [model.id, model]));
 
-  api.registerProvider("cpa", {
+  api.registerProvider(PROVIDER_NAME, {
     name: "CLIProxyAPI",
     baseUrl: `${config.baseUrl}/v1`,
     apiKey: config.apiKey,
@@ -125,14 +127,14 @@ export async function activateOmp(
 
   /**
    * Startup model selection happens before extension providers register, so a
-   * persisted `cpa/…` default arrives as a provisional model carrying
+   * persisted `cliproxyapi/…` default arrives as a provisional model carrying
    * only its id. Re-selecting through `api.setModel` after registration lets
    * the host reconcile native image input and catalog capabilities.
    */
   function rebindStartupModel(_event: unknown, context: unknown): void {
     const ctx = context as { model?: unknown };
     const identity = extractModelIdentity(ctx?.model);
-    if (!identity || identity.provider !== "cpa" || !identity.id) return;
+    if (!identity || identity.provider !== PROVIDER_NAME || !identity.id) return;
     const builtModel = modelCache.get(identity.id);
     if (!builtModel) return;
     const target = ctx.model as Record<PropertyKey, unknown>;

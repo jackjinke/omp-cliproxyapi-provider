@@ -21,8 +21,8 @@
   `claude-fable-5-dd-<reversed id>` for Claude Code. The extension reverses them back to real routing ids.
 - **Fail-open startup.** If CPA is down or unconfigured, a warning is logged and OMP starts without the
   provider.
-- A persisted `cpa/…` startup model is rebound through `setModel` once the catalog registers, so
-  native image input and capabilities reconcile immediately.
+- A persisted `cliproxyapi/…` startup model is rebound through `setModel` once the catalog registers,
+  so native image input and capabilities reconcile immediately.
 
 ## What it does not do
 
@@ -62,7 +62,7 @@ Environment variables can also live in `~/.omp/agent/.env`.
 Then choose any discovered entry:
 
 ```bash
-omp --model cpa/<model-id>
+omp --model cliproxyapi/<model-id>
 ```
 
 ## Metadata for openai-compatibility models
