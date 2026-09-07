@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activateOmp, type OmpExtensionAPI, type OmpProviderConfig } from "../src/omp.ts";
@@ -11,6 +11,7 @@ import {
   readConfig,
   tryDiscoverModels,
   type CPAConfig,
+  type ModelsDevIndex,
 } from "../src/shared.ts";
 
 interface RegisteredProvider {
@@ -94,6 +95,7 @@ function testConfig(overrides: Partial<CPAConfig> = {}): CPAConfig {
     startupTimeoutMs: 15000,
     codexTransport: new Set(),
     effortOverrides: {},
+    modelOverrides: {},
     ...overrides,
   };
 }
@@ -452,6 +454,173 @@ describe("OMP adapter", () => {
     await host.emit("session_start", fakeContext(provisional));
     expect(provisional.contextWindow).toBeUndefined();
     expect(host.setModelCalls).toHaveLength(0);
+  });
+});
+
+describe("models.dev enrichment and overrides", () => {
+  /** Sparse entry as produced by CPA's openai-compatibility provider without extra config. */
+  const COMPAT_ENTRY = {
+    id: "glm-4.7",
+    type: "openai-compatibility",
+    display_name: "GLM 4.7",
+    owned_by: "zhipu",
+    thinking: { levels: ["low", "medium", "high"] },
+  };
+
+  function makeModelsDevResponse(providers: Record<string, Record<string, unknown>>): Response {
+    return new Response(
+      JSON.stringify(
+        Object.fromEntries(
+          Object.entries(providers).map(([id, models]) => [id, { id, name: id, models }]),
+        ),
+      ),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  test("parses models overrides, ignoring unknown fields", () => {
+    const environment = envWithConfig(`
+models:
+  glm-4.7:
+    contextWindow: 200000
+    maxTokens: 128000
+    futureField: 42
+  "*":
+    contextWindow: 100000
+`, { CLIPROXYAPI_API_KEY: "abc" });
+    const config = readConfig(environment);
+    expect(config.modelOverrides["glm-4.7"]).toEqual({ contextWindow: 200000, maxTokens: 128000 });
+    expect(config.modelOverrides["*"]).toEqual({ contextWindow: 100000 });
+  });
+
+  test("overrides apply to first-party channels and merge wildcard with exact", () => {
+    const config = testConfig({
+      modelOverrides: { "*": { maxTokens: 4096 }, "claude-opus-4-6": { contextWindow: 150000 } },
+    });
+    const [model] = normalizeCatalog([CLAUDE_ENTRY], config).models;
+    expect(model.contextWindow).toBe(150000);
+    expect(model.maxTokens).toBe(4096);
+  });
+
+  test("models.dev fills gaps only on openai-compatibility models", () => {
+    const index: ModelsDevIndex = {
+      "zhipu/glm47": { contextWindow: 204800, maxTokens: 131072, input: ["text", "image"] },
+      "zhipu/claudeopus46": { contextWindow: 999 },
+    };
+    const [compat, claude] = normalizeCatalog([COMPAT_ENTRY, CLAUDE_ENTRY], testConfig(), index).models;
+    expect(compat.contextWindow).toBe(204800);
+    expect(compat.maxTokens).toBe(131072);
+    expect(compat.input).toEqual(["text", "image"]);
+    expect(claude.contextWindow).toBe(200000);
+  });
+
+  test("CPA config metadata wins over models.dev per field", () => {
+    const entry = { ...COMPAT_ENTRY, context_length: 111000 };
+    const index: ModelsDevIndex = { "zhipu/glm47": { contextWindow: 204800, maxTokens: 131072 } };
+    const [model] = normalizeCatalog([entry], testConfig(), index).models;
+    expect(model.contextWindow).toBe(111000);
+    expect(model.maxTokens).toBe(131072);
+  });
+
+  test("overrides beat both CPA metadata and models.dev", () => {
+    const config = testConfig({ modelOverrides: { "glm-4.7": { contextWindow: 150000 } } });
+    const index: ModelsDevIndex = { "zhipu/glm47": { contextWindow: 204800 } };
+    const [model] = normalizeCatalog([COMPAT_ENTRY], config, index).models;
+    expect(model.contextWindow).toBe(150000);
+  });
+
+  test("matches by owner-scoped id, then owner-scoped display name", () => {
+    const index: ModelsDevIndex = {
+      "zhipu/glm47": { contextWindow: 222 },
+      "zhipu/customalias": { contextWindow: 111 },
+    };
+    const [byId] = normalizeCatalog([COMPAT_ENTRY], testConfig(), index).models;
+    expect(byId.contextWindow).toBe(222);
+    const [byName] = normalizeCatalog(
+      [{ ...COMPAT_ENTRY, id: "custom-alias" }],
+      testConfig(),
+      index,
+    ).models;
+    expect(byName.contextWindow).toBe(111);
+  });
+
+  test("never fills from a different provider's entry for the same model id", () => {
+    // Resellers report conflicting limits for shared ids like deepseek-v3.2;
+    // a wrong guess is worse than the fallback.
+    const index: ModelsDevIndex = { "somewhiteglove/deepseekv32": { contextWindow: 999 } };
+    const entry = {
+      ...COMPAT_ENTRY,
+      id: "deepseek-v3.2",
+      display_name: "DeepSeek V3.2",
+      owned_by: "deepseek",
+    };
+    const [model] = normalizeCatalog([entry], testConfig(), index).models;
+    expect(model.contextWindow).toBe(128000);
+  });
+
+  test("discoverModels enriches compat models and caches the catalog", async () => {
+    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
+    let modelsDevCalls = 0;
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+      if (String(input).includes("models.dev")) {
+        modelsDevCalls += 1;
+        return makeModelsDevResponse({
+          zhipu: {
+            "glm-4.7": {
+              id: "glm-4.7",
+              name: "GLM-4.7",
+              limit: { context: 204800, output: 131072 },
+              modalities: { input: ["text", "image"] },
+            },
+          },
+        });
+      }
+      return makeModelsResponse([COMPAT_ENTRY, CLAUDE_ENTRY]);
+    };
+
+    const first = await tryDiscoverModels(environment, fetcher);
+    const glm = first?.catalog.models.find((model) => model.id === "glm-4.7");
+    expect(glm?.contextWindow).toBe(204800);
+    expect(glm?.maxTokens).toBe(131072);
+    expect(modelsDevCalls).toBe(1);
+    const cachePath = join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json");
+    expect(existsSync(cachePath)).toBe(true);
+
+    // Second run within the TTL reads the cache without touching the network.
+    modelsDevCalls = 0;
+    const second = await tryDiscoverModels(environment, fetcher);
+    expect(second?.catalog.models.find((model) => model.id === "glm-4.7")?.contextWindow).toBe(204800);
+    expect(modelsDevCalls).toBe(0);
+  });
+
+  test("falls back to a stale models.dev cache when the network fails", async () => {
+    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
+    writeFileSync(
+      join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json"),
+      JSON.stringify({
+        fetchedAt: Date.now() - 48 * 60 * 60 * 1000,
+        index: { "zhipu/glm47": { contextWindow: 123456 } },
+      }),
+    );
+    const discovery = await tryDiscoverModels(environment, async (input) => {
+      if (String(input).includes("models.dev")) throw new Error("offline");
+      return makeModelsResponse([COMPAT_ENTRY]);
+    });
+    expect(discovery?.catalog.models[0]?.contextWindow).toBe(123456);
+  });
+
+  test("skips the models.dev fetch when no compat models are present", async () => {
+    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
+    let modelsDevCalls = 0;
+    const discovery = await tryDiscoverModels(environment, async (input) => {
+      if (String(input).includes("models.dev")) {
+        modelsDevCalls += 1;
+        throw new Error("should not fetch");
+      }
+      return makeModelsResponse([CLAUDE_ENTRY]);
+    });
+    expect(discovery?.catalog.models).toHaveLength(1);
+    expect(modelsDevCalls).toBe(0);
   });
 });
 

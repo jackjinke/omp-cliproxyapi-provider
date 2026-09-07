@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 export interface CPAModel {
@@ -39,13 +39,37 @@ export interface CPACatalog {
   models: CPAModel[];
 }
 
+/**
+ * Per-model metadata overrides from `cliproxyapi.yml`. New fields slot in by
+ * extending this interface and OVERRIDABLE_MODEL_FIELDS together.
+ */
+export interface CPAModelOverride {
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
 export interface CPAConfig {
   apiKey: string;
   baseUrl: string;
   startupTimeoutMs: number;
   codexTransport: Set<string>;
   effortOverrides: Record<string, string[]>;
+  modelOverrides: Record<string, CPAModelOverride>;
 }
+
+export interface ModelsDevModelInfo {
+  contextWindow?: number;
+  maxTokens?: number;
+  input?: ("text" | "image")[];
+}
+
+/**
+ * Flat lookup over the models.dev catalog, keyed `<provider>/<model>` with all
+ * parts normalized to `a-z0-9`. Deliberately provider-scoped only: resellers
+ * report conflicting limits for the same bare model id, so cross-provider
+ * guessing is worse than the fallback.
+ */
+export type ModelsDevIndex = Record<string, ModelsDevModelInfo>;
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8317";
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
@@ -60,6 +84,13 @@ const SUPPORTED_EFFORTS: Record<string, true> = {
 };
 const FALLBACK_CONTEXT_WINDOW = 128_000;
 const FALLBACK_MAX_TOKENS = 16_384;
+
+const MODELS_DEV_URL = "https://models.dev/api.json";
+const MODELS_DEV_CACHE_FILE = "cliproxyapi.models-dev.cache.json";
+const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Model fields a `models:` override entry may set; extend to support more. */
+const OVERRIDABLE_MODEL_FIELDS = ["contextWindow", "maxTokens"] as const;
 
 /**
  * CLIProxyAPI disguises non-Claude model IDs in Anthropic-shaped model listings
@@ -98,6 +129,7 @@ export function readConfig(
     startupTimeoutMs: normalizeTimeout(environment.CLIPROXYAPI_STARTUP_TIMEOUT_MS),
     codexTransport: new Set(),
     effortOverrides: {},
+    modelOverrides: {},
   };
 
   if (existsSync(configPath)) {
@@ -107,6 +139,10 @@ export function readConfig(
       for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
         const normalizedKey = key.trim();
         if (!normalizedKey) continue;
+        if (normalizedKey === "models") {
+          config.modelOverrides = parseModelOverrides(value);
+          continue;
+        }
         if (normalizedKey === "codex_transport") {
           if (Array.isArray(value)) {
             for (const entry of value) {
@@ -130,6 +166,27 @@ function normalizeTimeout(raw: string | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STARTUP_TIMEOUT_MS;
 }
 
+/**
+ * Parses the `models:` map. Unknown fields are ignored so newer config files
+ * keep loading on older extension versions; new override fields are added by
+ * extending OVERRIDABLE_MODEL_FIELDS.
+ */
+function parseModelOverrides(value: unknown): Record<string, CPAModelOverride> {
+  const overrides: Record<string, CPAModelOverride> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return overrides;
+  for (const [modelId, fields] of Object.entries(value as Record<string, unknown>)) {
+    const id = modelId.trim();
+    if (!id || !fields || typeof fields !== "object" || Array.isArray(fields)) continue;
+    const override: CPAModelOverride = {};
+    for (const field of OVERRIDABLE_MODEL_FIELDS) {
+      const parsed = Number((fields as Record<string, unknown>)[field]);
+      if (Number.isFinite(parsed) && parsed > 0) override[field] = Math.floor(parsed);
+    }
+    overrides[id] = override;
+  }
+  return overrides;
+}
+
 export function decodeClaudeDDId(id: string): string {
   if (!id.startsWith(CLAUDE_DD_PREFIX)) return id;
   const encoded = id.slice(CLAUDE_DD_PREFIX.length);
@@ -137,11 +194,11 @@ export function decodeClaudeDDId(id: string): string {
   return [...encoded].reverse().join("");
 }
 
-async function fetchModelsOnce(
+async function fetchEntriesOnce(
   config: CPAConfig,
   path: string,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
-): Promise<CPAModel[]> {
+): Promise<unknown[]> {
   const response = await fetcher(`${config.baseUrl}${path}`, {
     headers: {
       Accept: "application/json",
@@ -155,19 +212,18 @@ async function fetchModelsOnce(
     throw new Error(`CLIProxyAPI ${path} failed with HTTP ${response.status}`);
   }
   const payload = (await response.json()) as { data?: unknown };
-  const entries = Array.isArray(payload?.data) ? payload.data : [];
-  return normalizeCatalog(entries, config).models;
+  return Array.isArray(payload?.data) ? payload.data : [];
 }
 
 async function fetchWithTimeout(
   config: CPAConfig,
   path: string,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
-): Promise<CPAModel[]> {
+): Promise<unknown[]> {
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      fetchModelsOnce(config, path, fetcher),
+      fetchEntriesOnce(config, path, fetcher),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
           () => reject(new Error(`CLIProxyAPI ${path} timed out after ${config.startupTimeoutMs}ms`)),
@@ -180,8 +236,8 @@ async function fetchWithTimeout(
   }
 }
 
-async function fetchViaCurl(config: CPAConfig, path: string): Promise<CPAModel[]> {
-  return await new Promise<CPAModel[]>((resolve, reject) => {
+async function fetchViaCurl(config: CPAConfig, path: string): Promise<unknown[]> {
+  return await new Promise<unknown[]>((resolve, reject) => {
     const child = spawn(
       "curl",
       [
@@ -217,8 +273,7 @@ async function fetchViaCurl(config: CPAConfig, path: string): Promise<CPAModel[]
       }
       try {
         const payload = JSON.parse(stdout) as { data?: unknown };
-        const entries = Array.isArray(payload?.data) ? payload.data : [];
-        resolve(normalizeCatalog(entries, config).models);
+        resolve(Array.isArray(payload?.data) ? payload.data : []);
       } catch (error) {
         reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -226,11 +281,11 @@ async function fetchViaCurl(config: CPAConfig, path: string): Promise<CPAModel[]
   });
 }
 
-async function fetchWithRecovery(
+async function fetchEntriesWithRecovery(
   config: CPAConfig,
   path: string,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
-): Promise<CPAModel[]> {
+): Promise<unknown[]> {
   try {
     return await fetchWithTimeout(config, path, fetcher);
   } catch (error) {
@@ -249,11 +304,157 @@ function isRetryableDiscoveryError(error: unknown): boolean {
   return /unexpected token|JSON Parse error|failed to parse|timed out/i.test(error.message);
 }
 
+function normalizeModelsDevKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function indexModelsDevPayload(payload: unknown): ModelsDevIndex {
+  const index: ModelsDevIndex = {};
+  if (!payload || typeof payload !== "object") return index;
+  for (const [providerId, provider] of Object.entries(payload as Record<string, unknown>)) {
+    if (!provider || typeof provider !== "object") continue;
+    const models = (provider as Record<string, unknown>).models;
+    if (!models || typeof models !== "object") continue;
+    for (const [modelId, entry] of Object.entries(models as Record<string, unknown>)) {
+      if (!entry || typeof entry !== "object") continue;
+      const record = entry as Record<string, unknown>;
+      const limit = firstRecord(record.limit);
+      const modalities = firstRecord(record.modalities);
+      const info: ModelsDevModelInfo = {
+        contextWindow: firstInteger(limit?.context),
+        maxTokens: firstInteger(limit?.output),
+        input: normalizeInputModalities({
+          supportedInputModalities: firstArray(modalities?.input),
+        }),
+      };
+      const scopedKey = `${normalizeModelsDevKey(providerId)}/${normalizeModelsDevKey(modelId)}`;
+      index[scopedKey] ??= info;
+      const name = firstString(record.name);
+      if (name) index[`${normalizeModelsDevKey(providerId)}/${normalizeModelsDevKey(name)}`] ??= info;
+    }
+  }
+  return index;
+}
+
+interface ModelsDevCacheFile {
+  fetchedAt: number;
+  index: ModelsDevIndex;
+}
+
+/**
+ * Loads the models.dev catalog for filling gaps in openai-compatibility model
+ * metadata, caching the normalized index for a day. Stale cache is used when
+ * the network fails; absence of both just skips enrichment.
+ */
+async function loadModelsDevIndex(
+  config: CPAConfig,
+  configPath: string,
+  fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+): Promise<ModelsDevIndex | null> {
+  const cachePath = join(dirname(configPath), MODELS_DEV_CACHE_FILE);
+  let stale: ModelsDevIndex | null = null;
+  if (existsSync(cachePath)) {
+    try {
+      const cached = JSON.parse(readFileSync(cachePath, "utf8")) as ModelsDevCacheFile;
+      if (cached && typeof cached === "object" && cached.index && typeof cached.index === "object") {
+        if (Date.now() - cached.fetchedAt < MODELS_DEV_CACHE_TTL_MS) return cached.index;
+        stale = cached.index;
+      }
+    } catch {
+      // Unreadable cache is rebuilt from the network below.
+    }
+  }
+
+  try {
+    let timeout: NodeJS.Timeout | undefined;
+    const response = await Promise.race([
+      fetcher(MODELS_DEV_URL, { headers: { Accept: "application/json" } }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`models.dev catalog timed out after ${config.startupTimeoutMs}ms`)),
+          config.startupTimeoutMs,
+        );
+      }),
+    ]).finally(() => clearTimeout(timeout));
+    if (!response.ok) throw new Error(`models.dev catalog failed with HTTP ${response.status}`);
+    const index = indexModelsDevPayload(await response.json());
+    try {
+      writeFileSync(cachePath, JSON.stringify({ fetchedAt: Date.now(), index } satisfies ModelsDevCacheFile));
+    } catch {
+      // Cache writes are best-effort; enrichment still applies this run.
+    }
+    return index;
+  } catch (error) {
+    if (stale) return stale;
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[cliproxyapi] models.dev catalog unavailable; metadata fill-in skipped: ${message}`);
+    return null;
+  }
+}
+
+/**
+ * Fills metadata gaps on openai-compatibility entries from the models.dev
+ * index. CPA config stays canonical: only fields the CPA listing did not
+ * carry are filled. Matches the entry's owner (the compat provider name in
+ * CPAMP) against models.dev provider ids, by model id then display name.
+ */
+function enrichFromModelsDev(
+  entry: Record<string, unknown>,
+  model: CPAModel,
+  index: ModelsDevIndex,
+): void {
+  const owner = normalizeModelsDevKey(firstString(entry.owned_by) ?? "");
+  if (!owner) return;
+  const info =
+    index[`${owner}/${normalizeModelsDevKey(model.id)}`] ??
+    index[`${owner}/${normalizeModelsDevKey(model.name)}`];
+  if (!info) return;
+
+  const cpaContext = firstInteger(
+    entry.context_length,
+    entry.max_input_tokens,
+    entry.context_window,
+    entry.inputTokenLimit,
+  );
+  if (cpaContext === undefined && info.contextWindow !== undefined) {
+    model.contextWindow = info.contextWindow;
+  }
+  const cpaMaxOutput = firstInteger(
+    entry.max_completion_tokens,
+    entry.max_output_tokens,
+    entry.max_tokens,
+    entry.outputTokenLimit,
+  );
+  if (cpaMaxOutput === undefined && info.maxTokens !== undefined) {
+    model.maxTokens = info.maxTokens;
+  }
+  const cpaModalities = firstArray(
+    entry.supportedInputModalities,
+    entry.supported_input_modalities,
+    entry.input_modalities,
+  );
+  if (cpaModalities.length === 0 && entry.vision !== true && info.input !== undefined) {
+    model.input = info.input;
+  }
+}
+
 export async function discoverModels(
   config: CPAConfig,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
+  configPath?: string,
 ): Promise<CPACatalog> {
-  const models = await fetchWithRecovery(config, "/v1/models", fetcher);
+  const entries = await fetchEntriesWithRecovery(config, "/v1/models", fetcher);
+  const needsEnrichment = entries.some(
+    (entry) =>
+      entry &&
+      typeof entry === "object" &&
+      firstString((entry as Record<string, unknown>).type)?.toLowerCase() === "openai-compatibility",
+  );
+  const modelsDev =
+    needsEnrichment && configPath
+      ? await loadModelsDevIndex(config, configPath, fetcher)
+      : null;
+  const models = normalizeCatalog(entries, config, modelsDev ?? undefined).models;
   if (models.length === 0) {
     throw new Error(
       "CLIProxyAPI returned no usable models; configure at least one upstream provider first",
@@ -335,9 +536,21 @@ function parseEfforts(
   return [...efforts, ...extras];
 }
 
+function applyModelOverrides(model: CPAModel, config: CPAConfig): void {
+  const merged: CPAModelOverride = {
+    ...config.modelOverrides["*"],
+    ...config.modelOverrides[model.id],
+  };
+  for (const field of OVERRIDABLE_MODEL_FIELDS) {
+    const value = merged[field];
+    if (value !== undefined) model[field] = value;
+  }
+}
+
 export function extractCPAModel(
   entry: Record<string, unknown>,
   config: CPAConfig,
+  modelsDev?: ModelsDevIndex,
 ): CPAModel | null {
   const rawId = firstString(entry.id, entry.name);
   if (!rawId) return null;
@@ -369,7 +582,7 @@ export function extractCPAModel(
   const efforts = reasoning ? parseEfforts(entry, config, id, thinking) : [];
   const effortMap = Object.fromEntries(efforts.map((effort) => [effort, effort]));
 
-  return {
+  const model: CPAModel = {
     id,
     name: firstString(entry.display_name, entry.displayName) ?? id,
     channel,
@@ -401,13 +614,22 @@ export function extractCPAModel(
       supportsStrictMode: false,
     },
   };
+  if (modelsDev && channel === "openai-compatibility") {
+    enrichFromModelsDev(entry, model, modelsDev);
+  }
+  applyModelOverrides(model, config);
+  return model;
 }
 
-export function normalizeCatalog(entries: unknown[], config: CPAConfig): CPACatalog {
+export function normalizeCatalog(
+  entries: unknown[],
+  config: CPAConfig,
+  modelsDev?: ModelsDevIndex,
+): CPACatalog {
   const models: CPAModel[] = [];
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
-    const model = extractCPAModel(entry as Record<string, unknown>, config);
+    const model = extractCPAModel(entry as Record<string, unknown>, config, modelsDev);
     if (model) models.push(model);
   }
   return { models };
@@ -427,9 +649,10 @@ export async function tryDiscoverModels(
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
   configPath?: string,
 ): Promise<CPADiscovery | null> {
+  const resolvedConfigPath = configPath ?? cliproxyapiConfigPath(environment);
   let config: CPAConfig;
   try {
-    config = readConfig(environment, configPath);
+    config = readConfig(environment, resolvedConfigPath);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/CLIPROXYAPI_API_KEY is required/.test(message)) {
@@ -439,7 +662,7 @@ export async function tryDiscoverModels(
   }
 
   try {
-    const catalog = await discoverModels(config, fetcher);
+    const catalog = await discoverModels(config, fetcher, resolvedConfigPath);
     return { config, catalog };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
