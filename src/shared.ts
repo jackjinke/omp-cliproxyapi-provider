@@ -382,11 +382,19 @@ export function extractCPAModel(
     supportsTools: true,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow:
-      firstInteger(entry.context_length, entry.max_input_tokens, entry.context_window) ??
-      FALLBACK_CONTEXT_WINDOW,
+      firstInteger(
+        entry.context_length,
+        entry.max_input_tokens,
+        entry.context_window,
+        entry.inputTokenLimit, // gemini-family channels
+      ) ?? FALLBACK_CONTEXT_WINDOW,
     maxTokens:
-      firstInteger(entry.max_completion_tokens, entry.max_output_tokens, entry.max_tokens) ??
-      FALLBACK_MAX_TOKENS,
+      firstInteger(
+        entry.max_completion_tokens,
+        entry.max_output_tokens,
+        entry.max_tokens,
+        entry.outputTokenLimit, // gemini-family channels
+      ) ?? FALLBACK_MAX_TOKENS,
     compat: {
       supportsReasoningParams: reasoning,
       supportsReasoningEffort: reasoning,

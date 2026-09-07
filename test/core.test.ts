@@ -311,6 +311,24 @@ describe("shared catalog logic", () => {
     expect(model.reasoning).toBe(false);
   });
 
+  test("reads gemini-family token limit fields", () => {
+    const gemini = {
+      id: "gemini-2.5-pro",
+      type: "gemini",
+      display_name: "Gemini 2.5 Pro",
+      inputTokenLimit: 1048576,
+      outputTokenLimit: 65536,
+      thinking: { min: 128, max: 32768, dynamic_allowed: true },
+      supportedInputModalities: ["text", "image", "audio", "video"],
+    };
+    const [model] = normalizeCatalog([gemini], testConfig()).models;
+    expect(model.contextWindow).toBe(1048576);
+    expect(model.maxTokens).toBe(65536);
+    expect(model.reasoning).toBe(true);
+    // Host input types are limited to text and image; audio/video drop.
+    expect(model.input).toEqual(["text", "image"]);
+  });
+
   test("drops unusable entries", () => {
     const { models } = normalizeCatalog([{ display_name: "no id" }, null, 42], testConfig());
     expect(models).toHaveLength(0);
