@@ -455,6 +455,18 @@ describe("OMP adapter", () => {
     expect(provisional.contextWindow).toBeUndefined();
     expect(host.setModelCalls).toHaveLength(0);
   });
+
+  test("rebinds again when switching to another cliproxyapi session", async () => {
+    const host = new FakeHost();
+    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
+    await activateOmp(host, environment, async () => makeModelsResponse([KIMI_ENTRY]));
+    const first: FakeContextModel = { provider: "cliproxyapi", id: "kimi-k3-256k" };
+    await host.emit("session_start", fakeContext(first));
+    const switched: FakeContextModel = { provider: "cliproxyapi", id: "kimi-k3-256k" };
+    await host.emit("session_switch", fakeContext(switched));
+    expect(switched.contextWindow).toBe(262144);
+    expect(host.setModelCalls).toHaveLength(2);
+  });
 });
 
 describe("models.dev enrichment and overrides", () => {

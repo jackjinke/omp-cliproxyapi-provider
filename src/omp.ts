@@ -129,7 +129,9 @@ export async function activateOmp(
    * Startup model selection happens before extension providers register, so a
    * persisted `cliproxyapi/…` default arrives as a provisional model carrying
    * only its id. Re-selecting through `api.setModel` after registration lets
-   * the host reconcile native image input and catalog capabilities.
+   * the host reconcile native image input and catalog capabilities. Switching
+   * sessions in a long-lived host brings in another unreconciled model object,
+   * so the same rebind runs on session_switch.
    */
   function rebindStartupModel(_event: unknown, context: unknown): void {
     const ctx = context as { model?: unknown };
@@ -148,4 +150,5 @@ export async function activateOmp(
   }
 
   api.on("session_start", rebindStartupModel);
+  api.on("session_switch", rebindStartupModel);
 }
