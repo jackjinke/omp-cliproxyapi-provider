@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -88,7 +88,7 @@ const FALLBACK_CONTEXT_WINDOW = 128_000;
 const FALLBACK_MAX_TOKENS = 16_384;
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
-const MODELS_DEV_CACHE_FILE = "cliproxyapi.models-dev.cache.json";
+const MODELS_DEV_CACHE_FILE = "models.dev.json";
 const MODELS_DEV_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 /** Model fields a `models:` override entry may set; extend to support more. */
@@ -337,7 +337,7 @@ async function loadModelsDevIndex(
   configPath: string,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ): Promise<ModelsDevIndex | null> {
-  const cachePath = join(dirname(configPath), MODELS_DEV_CACHE_FILE);
+  const cachePath = join(dirname(configPath), "cache", "cliproxyapi", MODELS_DEV_CACHE_FILE);
   let stale: ModelsDevIndex | null = null;
   if (existsSync(cachePath)) {
     try {
@@ -374,6 +374,7 @@ async function refreshModelsDevIndex(
     if (!response.ok) throw new Error(`models.dev catalog failed with HTTP ${response.status}`);
     const index = indexModelsDevPayload(await response.json());
     try {
+      mkdirSync(dirname(cachePath), { recursive: true });
       writeFileSync(cachePath, JSON.stringify({ fetchedAt: Date.now(), index } satisfies ModelsDevCacheFile));
     } catch {
       // Cache writes are best-effort; enrichment still applies this run.

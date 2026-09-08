@@ -82,8 +82,9 @@ models.dev lookup. Missing models.dev fields retain the corresponding Pi values.
   not identify every backing provider. Unmatched entries fall back to Pi; no cross-provider search is used.
 - Reasoning **support** may come from models.dev, but effort levels and their default remain CPA's
   settings. No additional reasoning-level catalog is consulted.
-- The normalized models.dev index is cached for **6 hours** at `cliproxyapi.models-dev.cache.json`
-  beside `cliproxyapi.yml`. Fresh cache entries require no models.dev request.
+- The normalized models.dev index is cached for **6 hours** at
+  `~/.omp/agent/cache/cliproxyapi/models.dev.json` (under `PI_CODING_AGENT_DIR` when set).
+  Fresh cache entries require no models.dev request.
 - An expired readable cache is used immediately; refresh runs in the background for subsequent
   discoveries. It does not alter the already registered models. Refresh failure preserves the old cache.
 - With no readable cache, discovery waits for the initial fetch. If that fails, it uses Pi metadata.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activateOmp, type OmpExtensionAPI, type OmpProviderConfig } from "../src/omp.ts";
@@ -598,7 +598,7 @@ models:
     expect(glm?.contextWindow).toBe(204800);
     expect(glm?.maxTokens).toBe(131072);
     expect(modelsDevCalls).toBe(1);
-    const cachePath = join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json");
+    const cachePath = join(environment.PI_CODING_AGENT_DIR, "cache", "cliproxyapi", "models.dev.json");
     expect(existsSync(cachePath)).toBe(true);
 
     // Second run within the TTL reads the cache without touching the network.
@@ -610,7 +610,8 @@ models:
 
   test("six-hour-old cache loads before refresh and the next discovery sees refreshed metadata", async () => {
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
-    const cachePath = join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json");
+    const cachePath = join(environment.PI_CODING_AGENT_DIR, "cache", "cliproxyapi", "models.dev.json");
+    mkdirSync(join(environment.PI_CODING_AGENT_DIR, "cache", "cliproxyapi"), { recursive: true });
     writeFileSync(cachePath, JSON.stringify({
       fetchedAt: Date.now() - 6 * 60 * 60 * 1000,
       index: { "zhipu/glm47": { contextWindow: 123456 } },
@@ -644,8 +645,9 @@ models:
 
   test("keeps a stale models.dev cache when background refresh fails", async () => {
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
+    mkdirSync(join(environment.PI_CODING_AGENT_DIR, "cache", "cliproxyapi"), { recursive: true });
     writeFileSync(
-      join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json"),
+      join(environment.PI_CODING_AGENT_DIR, "cache", "cliproxyapi", "models.dev.json"),
       JSON.stringify({
         fetchedAt: Date.now() - 48 * 60 * 60 * 1000,
         index: { "zhipu/glm47": { contextWindow: 123456 } },
