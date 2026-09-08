@@ -15,7 +15,6 @@ export interface OmpExtensionAPI {
 export interface OmpProviderModel extends CPAModel {
   api?: string;
   baseUrl?: string;
-  preferWebsockets?: boolean;
   useResponsesLite?: boolean;
   remoteCompaction?: {
     enabled: boolean;
@@ -50,9 +49,8 @@ function codexBaseUrl(baseUrl: string): string {
 }
 
 /**
- * Every remaining channel (kimi, glm/bigmodel, deepseek, opencode-go, …) is
- * spoken to its upstream over chat completions by CPA's executors, so asking
- * for Responses or Messages client-side would only add a translation hop.
+ * Models outside the known Claude/Codex families default to chat completions.
+ * The Pi catalog's connection preferences do not identify an upstream protocol.
  */
 const GENERIC_API = "openai-completions";
 

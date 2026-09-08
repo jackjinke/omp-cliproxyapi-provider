@@ -7,8 +7,6 @@ import { parse as parseYaml } from "yaml";
 export interface CPAModel {
   id: string;
   name: string;
-  /** CLIProxyAPI channel the model routes to (claude, codex, kimi, gemini, …). */
-  channel: string;
   isCodex: boolean;
   isClaude: boolean;
   reasoning: boolean;
@@ -16,8 +14,10 @@ export interface CPAModel {
     mode: "effort";
     efforts: string[];
     effortMap: Record<string, string>;
+    defaultLevel?: string;
   };
   thinkingLevelMap?: Record<string, string>;
+  preferWebsockets?: boolean;
   input: ("text" | "image")[];
   supportsTools: boolean;
   cost: {
@@ -61,6 +61,8 @@ export interface ModelsDevModelInfo {
   contextWindow?: number;
   maxTokens?: number;
   input?: ("text" | "image")[];
+  reasoning?: boolean;
+  supportsTools?: boolean;
 }
 
 /**
@@ -87,17 +89,10 @@ const FALLBACK_MAX_TOKENS = 16_384;
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_FILE = "cliproxyapi.models-dev.cache.json";
-const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const MODELS_DEV_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 /** Model fields a `models:` override entry may set; extend to support more. */
 const OVERRIDABLE_MODEL_FIELDS = ["contextWindow", "maxTokens"] as const;
-
-/**
- * CLIProxyAPI disguises non-Claude model IDs in Anthropic-shaped model listings
- * as `claude-fable-5-dd-` + the reversed ID, so Claude Code accepts them. This
- * extension is not Claude Code: decode them back to the routing IDs.
- */
-const CLAUDE_DD_PREFIX = "claude-fable-5-dd-";
 
 type Environment = Record<string, string | undefined>;
 
@@ -187,43 +182,35 @@ function parseModelOverrides(value: unknown): Record<string, CPAModelOverride> {
   return overrides;
 }
 
-export function decodeClaudeDDId(id: string): string {
-  if (!id.startsWith(CLAUDE_DD_PREFIX)) return id;
-  const encoded = id.slice(CLAUDE_DD_PREFIX.length);
-  if (!encoded) return id;
-  return [...encoded].reverse().join("");
-}
-
 async function fetchEntriesOnce(
   config: CPAConfig,
   path: string,
+  listKey: "models" | "data",
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ): Promise<unknown[]> {
   const response = await fetcher(`${config.baseUrl}${path}`, {
     headers: {
       Accept: "application/json",
       Authorization: `Bearer ${config.apiKey}`,
-      // Selects CPA's rich Anthropic-shaped model listing instead of the
-      // four-field OpenAI listing on the same /v1/models route.
-      "Anthropic-Version": "2023-06-01",
     },
   });
   if (!response.ok) {
     throw new Error(`CLIProxyAPI ${path} failed with HTTP ${response.status}`);
   }
-  const payload = (await response.json()) as { data?: unknown };
-  return Array.isArray(payload?.data) ? payload.data : [];
+  const payload = (await response.json()) as Record<string, unknown>;
+  return firstArray(payload?.[listKey]);
 }
 
 async function fetchWithTimeout(
   config: CPAConfig,
   path: string,
+  listKey: "models" | "data",
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ): Promise<unknown[]> {
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      fetchEntriesOnce(config, path, fetcher),
+      fetchEntriesOnce(config, path, listKey, fetcher),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
           () => reject(new Error(`CLIProxyAPI ${path} timed out after ${config.startupTimeoutMs}ms`)),
@@ -236,7 +223,7 @@ async function fetchWithTimeout(
   }
 }
 
-async function fetchViaCurl(config: CPAConfig, path: string): Promise<unknown[]> {
+async function fetchViaCurl(config: CPAConfig, path: string, listKey: "models" | "data"): Promise<unknown[]> {
   return await new Promise<unknown[]>((resolve, reject) => {
     const child = spawn(
       "curl",
@@ -246,8 +233,6 @@ async function fetchViaCurl(config: CPAConfig, path: string): Promise<unknown[]>
         String(Math.max(1, Math.ceil(config.startupTimeoutMs / 1000))),
         "-H",
         `Authorization: Bearer ${config.apiKey}`,
-        "-H",
-        "Anthropic-Version: 2023-06-01",
         "-H",
         "Accept: application/json",
         `${config.baseUrl}${path}`,
@@ -272,8 +257,8 @@ async function fetchViaCurl(config: CPAConfig, path: string): Promise<unknown[]>
         return;
       }
       try {
-        const payload = JSON.parse(stdout) as { data?: unknown };
-        resolve(Array.isArray(payload?.data) ? payload.data : []);
+        const payload = JSON.parse(stdout) as Record<string, unknown>;
+        resolve(firstArray(payload?.[listKey]));
       } catch (error) {
         reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -284,19 +269,20 @@ async function fetchViaCurl(config: CPAConfig, path: string): Promise<unknown[]>
 async function fetchEntriesWithRecovery(
   config: CPAConfig,
   path: string,
+  listKey: "models" | "data",
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ): Promise<unknown[]> {
   try {
-    return await fetchWithTimeout(config, path, fetcher);
+    return await fetchWithTimeout(config, path, listKey, fetcher);
   } catch (error) {
     if (!isRetryableDiscoveryError(error)) throw error;
   }
   try {
-    return await fetchWithTimeout(config, path, fetcher);
+    return await fetchWithTimeout(config, path, listKey, fetcher);
   } catch (error) {
     if (!isRetryableDiscoveryError(error)) throw error;
   }
-  return await fetchViaCurl(config, path);
+  return await fetchViaCurl(config, path, listKey);
 }
 
 function isRetryableDiscoveryError(error: unknown): boolean {
@@ -323,9 +309,9 @@ function indexModelsDevPayload(payload: unknown): ModelsDevIndex {
       const info: ModelsDevModelInfo = {
         contextWindow: firstInteger(limit?.context),
         maxTokens: firstInteger(limit?.output),
-        input: normalizeInputModalities({
-          supportedInputModalities: firstArray(modalities?.input),
-        }),
+        input: firstArray(modalities?.input).length > 0 ? normalizeInputModalities(modalities?.input) : undefined,
+        reasoning: typeof record.reasoning === "boolean" ? record.reasoning : undefined,
+        supportsTools: typeof record.tool_call === "boolean" ? record.tool_call : undefined,
       };
       const scopedKey = `${normalizeModelsDevKey(providerId)}/${normalizeModelsDevKey(modelId)}`;
       index[scopedKey] ??= info;
@@ -342,9 +328,9 @@ interface ModelsDevCacheFile {
 }
 
 /**
- * Loads the models.dev catalog for filling gaps in openai-compatibility model
- * metadata, caching the normalized index for a day. Stale cache is used when
- * the network fails; absence of both just skips enrichment.
+ * Loads the models.dev catalog with a six-hour cache. Expired entries are
+ * returned immediately while the cache refreshes for subsequent discoveries.
+ * Without a readable cache, discovery waits for the initial fetch.
  */
 async function loadModelsDevIndex(
   config: CPAConfig,
@@ -365,6 +351,15 @@ async function loadModelsDevIndex(
     }
   }
 
+  const refresh = refreshModelsDevIndex(config, cachePath, fetcher);
+  return stale ?? await refresh;
+}
+
+async function refreshModelsDevIndex(
+  config: CPAConfig,
+  cachePath: string,
+  fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+): Promise<ModelsDevIndex | null> {
   try {
     let timeout: NodeJS.Timeout | undefined;
     const response = await Promise.race([
@@ -385,57 +380,30 @@ async function loadModelsDevIndex(
     }
     return index;
   } catch (error) {
-    if (stale) return stale;
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[cliproxyapi] models.dev catalog unavailable; metadata fill-in skipped: ${message}`);
+    console.warn(`[cliproxyapi] models.dev catalog refresh failed: ${message}`);
     return null;
   }
 }
 
-/**
- * Fills metadata gaps on openai-compatibility entries from the models.dev
- * index. CPA config stays canonical: only fields the CPA listing did not
- * carry are filled. Matches the entry's owner (the compat provider name in
- * CPAMP) against models.dev provider ids, by model id then display name.
- */
-function enrichFromModelsDev(
-  entry: Record<string, unknown>,
-  model: CPAModel,
-  index: ModelsDevIndex,
-): void {
-  const owner = normalizeModelsDevKey(firstString(entry.owned_by) ?? "");
-  if (!owner) return;
-  const info =
-    index[`${owner}/${normalizeModelsDevKey(model.id)}`] ??
-    index[`${owner}/${normalizeModelsDevKey(model.name)}`];
-  if (!info) return;
-
-  const cpaContext = firstInteger(
-    entry.context_length,
-    entry.max_input_tokens,
-    entry.context_window,
-    entry.inputTokenLimit,
-  );
-  if (cpaContext === undefined && info.contextWindow !== undefined) {
-    model.contextWindow = info.contextWindow;
+async function loadModelOwners(
+  config: CPAConfig,
+  fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+): Promise<Map<string, string>> {
+  const owners = new Map<string, string>();
+  try {
+    const entries = await fetchEntriesWithRecovery(config, "/v1/models", "data", fetcher);
+    for (const value of entries) {
+      const entry = firstRecord(value);
+      const id = firstString(entry?.id);
+      const owner = firstString(entry?.owned_by);
+      if (id && owner) owners.set(id, owner);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[cliproxyapi] model owner discovery failed; provider-scoped enrichment unavailable: ${message}`);
   }
-  const cpaMaxOutput = firstInteger(
-    entry.max_completion_tokens,
-    entry.max_output_tokens,
-    entry.max_tokens,
-    entry.outputTokenLimit,
-  );
-  if (cpaMaxOutput === undefined && info.maxTokens !== undefined) {
-    model.maxTokens = info.maxTokens;
-  }
-  const cpaModalities = firstArray(
-    entry.supportedInputModalities,
-    entry.supported_input_modalities,
-    entry.input_modalities,
-  );
-  if (cpaModalities.length === 0 && entry.vision !== true && info.input !== undefined) {
-    model.input = info.input;
-  }
+  return owners;
 }
 
 export async function discoverModels(
@@ -443,17 +411,23 @@ export async function discoverModels(
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
   configPath?: string,
 ): Promise<CPACatalog> {
-  const entries = await fetchEntriesWithRecovery(config, "/v1/models", fetcher);
-  const needsEnrichment = entries.some(
-    (entry) =>
-      entry &&
-      typeof entry === "object" &&
-      firstString((entry as Record<string, unknown>).type)?.toLowerCase() === "openai-compatibility",
-  );
-  const modelsDev =
-    needsEnrichment && configPath
-      ? await loadModelsDevIndex(config, configPath, fetcher)
-      : null;
+  const payload = await fetchEntriesWithRecovery(config, "/v1/models?client_version=pi", "models", fetcher);
+  const entries = payload.filter((value): value is Record<string, unknown> => {
+    const entry = firstRecord(value);
+    return entry !== undefined && firstString(entry.slug) !== undefined;
+  });
+  let modelsDev: ModelsDevIndex | null = null;
+  if (entries.length > 0 && configPath) {
+    const needsOwners = entries.some((entry) => firstString(entry.owned_by) === undefined);
+    const [index, owners] = await Promise.all([
+      loadModelsDevIndex(config, configPath, fetcher),
+      needsOwners ? loadModelOwners(config, fetcher) : Promise.resolve(new Map<string, string>()),
+    ]);
+    modelsDev = index;
+    for (const entry of entries) {
+      entry.owned_by ??= owners.get(String(entry.slug));
+    }
+  }
   const models = normalizeCatalog(entries, config, modelsDev ?? undefined).models;
   if (models.length === 0) {
     throw new Error(
@@ -494,46 +468,25 @@ function firstInteger(...values: unknown[]): number | undefined {
   return undefined;
 }
 
-function normalizeInputModalities(entry: Record<string, unknown>): ("text" | "image")[] {
+function normalizeInputModalities(value: unknown): ("text" | "image")[] {
   // Host Model input types are limited to text and image.
-  const modalities = firstArray(
-    entry.supportedInputModalities,
-    entry.supported_input_modalities,
-    entry.input_modalities,
-  )
-    .map((value) => String(value).toLowerCase())
-    .filter((value): value is "text" | "image" => value === "text" || value === "image");
-  if (modalities.length > 0) return [...new Set(modalities)];
-  if (entry.vision === true) return ["text", "image"];
-  return ["text"];
-}
-
-function normalizeEffortTiers(
-  entry: Record<string, unknown>,
-  thinking: Record<string, unknown> | undefined,
-): string[] {
-  const candidates = firstArray(thinking?.levels, firstRecord(entry.capabilities)?.effort_tiers);
-  const supported = candidates
-    .map((value) => String(value).trim().toLowerCase())
-    .filter((value) => value in SUPPORTED_EFFORTS);
-  return [...new Set(supported)];
+  const modalities = firstArray(value)
+    .map((item) => String(item).toLowerCase())
+    .filter((item): item is "text" | "image" => item === "text" || item === "image");
+  return modalities.length > 0 ? [...new Set(modalities)] : ["text"];
 }
 
 function parseEfforts(
   entry: Record<string, unknown>,
   config: CPAConfig,
   id: string,
-  thinking: Record<string, unknown> | undefined,
 ): string[] {
   const override = config.effortOverrides[id] ?? config.effortOverrides["*"];
-  const efforts = normalizeEffortTiers(entry, thinking);
-  if (efforts.length === 0) return override && override.length > 0 ? override : [...DEFAULT_EFFORTS];
-  if (!override || override.length === 0) return efforts;
-
-  const allowed: Record<string, true> = {};
-  for (const effort of efforts) allowed[effort] = true;
-  const extras = override.filter((effort) => !(effort in allowed));
-  return [...efforts, ...extras];
+  if (!Array.isArray(entry.supported_reasoning_levels)) {
+    return override && override.length > 0 ? override : [...DEFAULT_EFFORTS];
+  }
+  const efforts = normalizeEfforts(entry.supported_reasoning_levels.map((value) => firstRecord(value)?.effort));
+  return [...new Set([...efforts, ...(override ?? [])])];
 }
 
 function applyModelOverrides(model: CPAModel, config: CPAConfig): void {
@@ -552,70 +505,60 @@ export function extractCPAModel(
   config: CPAConfig,
   modelsDev?: ModelsDevIndex,
 ): CPAModel | null {
-  const rawId = firstString(entry.id, entry.name);
-  if (!rawId) return null;
-  const id = decodeClaudeDDId(rawId);
+  const id = firstString(entry.slug);
   if (!id) return null;
+  const name = firstString(entry.display_name) ?? id;
+  const owner = normalizeModelsDevKey(firstString(entry.owned_by) ?? "");
+  const metadata = owner && modelsDev ? (
+    modelsDev[`${owner}/${normalizeModelsDevKey(id)}`] ??
+    modelsDev[`${owner}/${normalizeModelsDevKey(name)}`]
+  ) : undefined;
 
-  const channel = firstString(entry.type, entry.channel)?.toLowerCase() ?? "";
-  const owner = firstString(entry.owned_by)?.toLowerCase() ?? "";
-  const thinking = firstRecord(entry.thinking);
-
-  const isClaude = channel === "claude" || id.startsWith("claude-");
+  const isClaude = id.startsWith("claude-");
   const isCodex =
-    channel === "codex" ||
-    owner === "codex" ||
     id.startsWith("gpt-") ||
     id.startsWith("codex-") ||
     id.includes("/gpt-") ||
     config.codexTransport.has(id);
 
-  // Registry-backed entries carry `thinking`; Codex-family models arriving via
-  // proxied upstream listings (type "model", no thinking block) still support
-  // reasoning effort, except the gpt-image family. An exact-id effort override
-  // also opts a model into reasoning.
-  const reasoning =
-    thinking !== undefined ||
-    config.effortOverrides[id] !== undefined ||
-    (isCodex && !id.startsWith("gpt-image"));
-
-  const efforts = reasoning ? parseEfforts(entry, config, id, thinking) : [];
+  // Explicit empty effort lists must not acquire fallback levels. Image models
+  // can inherit a Codex template's effort list without supporting reasoning.
+  const reasoning = config.effortOverrides[id] !== undefined || (
+    metadata?.reasoning ?? (!id.startsWith("gpt-image") && (
+      firstArray(entry.supported_reasoning_levels).length > 0 ||
+      (isCodex && !Array.isArray(entry.supported_reasoning_levels))
+    ))
+  );
+  const efforts = reasoning ? parseEfforts(entry, config, id) : [];
   const effortMap = Object.fromEntries(efforts.map((effort) => [effort, effort]));
+  const defaultLevel = firstString(entry.default_reasoning_level);
 
   const model: CPAModel = {
     id,
-    name: firstString(entry.display_name, entry.displayName) ?? id,
-    channel,
+    name,
     isCodex,
     isClaude,
     reasoning,
-    thinking: reasoning ? { mode: "effort", efforts, effortMap } : undefined,
-    thinkingLevelMap: reasoning ? effortMap : undefined,
-    input: normalizeInputModalities(entry),
-    supportsTools: true,
+    thinking: efforts.length > 0 ? {
+      mode: "effort",
+      efforts,
+      effortMap,
+      defaultLevel: defaultLevel && efforts.includes(defaultLevel) ? defaultLevel : undefined,
+    } : undefined,
+    thinkingLevelMap: efforts.length > 0 ? effortMap : undefined,
+    input: metadata?.input ?? normalizeInputModalities(entry.input_modalities),
+    supportsTools: metadata?.supportsTools ?? true,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow:
-      firstInteger(
-        entry.context_length,
-        entry.max_input_tokens,
-        entry.context_window,
-        entry.inputTokenLimit, // gemini-family channels
-      ) ?? FALLBACK_CONTEXT_WINDOW,
-    maxTokens:
-      firstInteger(
-        entry.max_completion_tokens,
-        entry.max_output_tokens,
-        entry.max_tokens,
-        entry.outputTokenLimit, // gemini-family channels
-      ) ?? FALLBACK_MAX_TOKENS,
+    contextWindow: metadata?.contextWindow ?? firstInteger(entry.context_window, entry.max_context_window) ?? FALLBACK_CONTEXT_WINDOW,
+    maxTokens: metadata?.maxTokens ?? firstInteger(entry.max_tokens) ?? FALLBACK_MAX_TOKENS,
     compat: {
       supportsReasoningParams: reasoning,
       supportsReasoningEffort: reasoning,
       supportsStrictMode: false,
     },
   };
-  if (modelsDev && channel === "openai-compatibility") {
-    enrichFromModelsDev(entry, model, modelsDev);
+  if (isCodex && typeof entry.prefer_websockets === "boolean") {
+    model.preferWebsockets = entry.prefer_websockets;
   }
   applyModelOverrides(model, config);
   return model;

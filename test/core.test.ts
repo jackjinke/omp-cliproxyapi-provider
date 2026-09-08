@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { activateOmp, type OmpExtensionAPI, type OmpProviderConfig } from "../src/omp.ts";
 import {
   cliproxyapiConfigPath,
-  decodeClaudeDDId,
   extractCPAModel,
   normalizeCatalog,
   readConfig,
@@ -100,78 +99,48 @@ function testConfig(overrides: Partial<CPAConfig> = {}): CPAConfig {
   };
 }
 
-/** Shape of rich Anthropic-listing entries, mirroring internal/registry/models/models.json. */
+/** Pi/Codex client catalog entries, without channel or provider metadata. */
 const CLAUDE_ENTRY = {
-  id: "claude-opus-4-6",
-  object: "model",
-  created: 1770000000,
-  owned_by: "anthropic",
-  type: "claude",
+  slug: "claude-opus-4-6",
   display_name: "Claude Opus 4.6",
-  context_length: 200000,
-  max_completion_tokens: 64000,
-  thinking: { min: 1024, max: 32768, zero_allowed: false, levels: ["low", "medium", "high", "max"] },
-  supportedInputModalities: ["text", "image"],
-  supportedOutputModalities: ["text"],
+  context_window: 200000,
+  max_tokens: 64000,
+  supported_reasoning_levels: ["low", "medium", "high", "max"].map((effort) => ({ effort })),
+  input_modalities: ["text", "image"],
 };
 
 const CODEX_ENTRY = {
-  id: "gpt-5.3-codex",
-  object: "model",
-  created: 1770000000,
-  owned_by: "openai",
-  type: "codex",
+  slug: "gpt-5.3-codex",
   display_name: "GPT-5.3 Codex",
-  context_length: 400000,
-  max_completion_tokens: 128000,
-  thinking: { min: 0, max: 65535, zero_allowed: true, levels: ["low", "medium", "high", "xhigh"] },
-  supportedInputModalities: ["text", "image"],
+  context_window: 400000,
+  max_context_window: 1000000,
+  max_tokens: 128000,
+  supported_reasoning_levels: ["low", "medium", "high", "xhigh"].map((effort) => ({ effort })),
+  input_modalities: ["text", "image"],
+  prefer_websockets: true,
+  use_responses_lite: true,
 };
 
 const KIMI_ENTRY = {
-  id: "kimi-k3-256k",
-  object: "model",
-  created: 1770000000,
-  owned_by: "moonshot",
-  type: "kimi",
+  slug: "kimi-k3-256k",
   display_name: "Kimi K3 256K",
-  context_length: 262144,
-  max_completion_tokens: 32768,
-  thinking: { min: 0, max: 16384, zero_allowed: true },
-  supportedInputModalities: ["text", "image"],
+  context_window: 262144,
+  max_tokens: 32768,
+  supported_reasoning_levels: ["low", "medium", "high"].map((effort) => ({ effort })),
+  input_modalities: ["text", "image"],
 };
 
 const SPARSE_ENTRY = {
-  id: "deepseek-v3.2",
-  object: "model",
-  created: 1770000000,
-  owned_by: "deepseek",
-  type: "deepseek",
+  slug: "deepseek-v3.2",
   display_name: "DeepSeek V3.2",
 };
 
 function makeModelsResponse(entries: unknown[]): Response {
   return new Response(
-    JSON.stringify({ data: entries, has_more: false, first_id: null, last_id: null }),
+    JSON.stringify({ models: entries }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 }
-
-describe("claude-dd id decoding", () => {
-  test("round-trips cloaked ids", () => {
-    expect(decodeClaudeDDId("claude-fable-5-dd-3k-imik")).toBe("kimi-k3");
-    expect(decodeClaudeDDId("claude-fable-5-dd-xedoc-3.5-tpg")).toBe("gpt-5.3-codex");
-  });
-
-  test("leaves native claude ids and other ids untouched", () => {
-    expect(decodeClaudeDDId("claude-opus-4-6")).toBe("claude-opus-4-6");
-    expect(decodeClaudeDDId("kimi-k3-256k")).toBe("kimi-k3-256k");
-  });
-
-  test("leaves degenerate cloaked ids untouched", () => {
-    expect(decodeClaudeDDId("claude-fable-5-dd-")).toBe("claude-fable-5-dd-");
-  });
-});
 
 describe("shared catalog logic", () => {
   test("reads env config with defaults", () => {
@@ -200,7 +169,7 @@ describe("shared catalog logic", () => {
     expect(config.effortOverrides["kimi-k3-256k"]).toEqual(["low", "high"]);
   });
 
-  test("normalizes rich registry metadata", () => {
+  test("normalizes Pi catalog capabilities", () => {
     const { models } = normalizeCatalog([CLAUDE_ENTRY, CODEX_ENTRY, KIMI_ENTRY], testConfig());
     const [claude, codex, kimi] = models;
 
@@ -217,8 +186,7 @@ describe("shared catalog logic", () => {
     expect(codex.isCodex).toBe(true);
     expect(codex.isClaude).toBe(false);
 
-    // No levels listed: reasoning model falls back to the default effort set.
-    expect(kimi.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(kimi.thinking?.efforts).toEqual(["low", "medium", "high"]);
     expect(kimi.isClaude).toBe(false);
     expect(kimi.isCodex).toBe(false);
   });
@@ -226,10 +194,21 @@ describe("shared catalog logic", () => {
   test("drops unsupported effort tiers", () => {
     const entry = {
       ...CODEX_ENTRY,
-      thinking: { levels: ["auto", "none", "low", "high"] },
+      supported_reasoning_levels: ["auto", "none", "ultra", "low", "high"].map((effort) => ({ effort })),
     };
     const [model] = normalizeCatalog([entry], testConfig()).models;
     expect(model.thinking?.efforts).toEqual(["low", "high"]);
+  });
+
+  test("explicit empty and unsupported effort lists do not invent selectable levels", () => {
+    const [empty, unsupported] = normalizeCatalog([
+      { ...CODEX_ENTRY, supported_reasoning_levels: [] },
+      { ...CODEX_ENTRY, supported_reasoning_levels: [{ effort: "ultra" }] },
+    ], testConfig()).models;
+    expect(empty.reasoning).toBe(false);
+    expect(empty.thinking).toBeUndefined();
+    expect(unsupported.reasoning).toBe(true);
+    expect(unsupported.thinking).toBeUndefined();
   });
 
   test("applies effort overrides as additive extras", () => {
@@ -247,15 +226,8 @@ describe("shared catalog logic", () => {
     expect(model.input).toEqual(["text"]);
   });
 
-  test("decodes cloaked ids during normalization", () => {
-    const cloaked = { ...KIMI_ENTRY, id: "claude-fable-5-dd-k652-3k-imik" };
-    const [model] = normalizeCatalog([cloaked], testConfig()).models;
-    expect(model.id).toBe("kimi-k3-256k");
-    expect(model.channel).toBe("kimi");
-  });
-
   test("infers claude and codex wires from ids without channel metadata", () => {
-    const bare = (id: string) => ({ id });
+    const bare = (slug: string) => ({ slug });
     const config = testConfig();
     expect(extractCPAModel(bare("claude-sonnet-4-5"), config)?.isClaude).toBe(true);
     expect(extractCPAModel(bare("gpt-5"), config)?.isCodex).toBe(true);
@@ -264,19 +236,14 @@ describe("shared catalog logic", () => {
 
   test("honors codex_transport opt-in list", () => {
     const config = testConfig({ codexTransport: new Set(["custom/o3-pool"]) });
-    expect(extractCPAModel({ id: "custom/o3-pool" }, config)?.isCodex).toBe(true);
+    expect(extractCPAModel({ slug: "custom/o3-pool" }, config)?.isCodex).toBe(true);
   });
 
-  test("proxied upstream listings still mark codex models as reasoning", () => {
-    // Shape served by CPA for codex-api-key upstreams: no `thinking` block,
-    // Anthropic-style max_input_tokens/max_tokens, generic type.
+  test("Codex models without effort metadata retain the fallback levels", () => {
     const sparse = {
-      id: "gpt-5.5",
-      object: "model",
-      owned_by: "openai",
-      type: "model",
+      slug: "gpt-5.5",
       display_name: "GPT 5.5",
-      max_input_tokens: 272000,
+      context_window: 272000,
       max_tokens: 128000,
     };
     const [model] = normalizeCatalog([sparse], testConfig()).models;
@@ -288,13 +255,13 @@ describe("shared catalog logic", () => {
   });
 
   test("codex- prefix ids select the codex wire", () => {
-    const [model] = normalizeCatalog([{ id: "codex-auto-review" }], testConfig()).models;
+    const [model] = normalizeCatalog([{ slug: "codex-auto-review" }], testConfig()).models;
     expect(model.isCodex).toBe(true);
     expect(model.reasoning).toBe(true);
   });
 
   test("gpt-image models stay non-reasoning", () => {
-    const [model] = normalizeCatalog([{ id: "gpt-image-2", owned_by: "openai" }], testConfig()).models;
+    const [model] = normalizeCatalog([{ ...CODEX_ENTRY, slug: "gpt-image-2" }], testConfig()).models;
     expect(model.isCodex).toBe(true);
     expect(model.reasoning).toBe(false);
     expect(model.thinking).toBeUndefined();
@@ -313,21 +280,19 @@ describe("shared catalog logic", () => {
     expect(model.reasoning).toBe(false);
   });
 
-  test("reads gemini-family token limit fields", () => {
+  test("supports maximum-context fallback and filters non-image modalities", () => {
     const gemini = {
-      id: "gemini-2.5-pro",
-      type: "gemini",
+      slug: "gemini-2.5-pro",
       display_name: "Gemini 2.5 Pro",
-      inputTokenLimit: 1048576,
-      outputTokenLimit: 65536,
-      thinking: { min: 128, max: 32768, dynamic_allowed: true },
-      supportedInputModalities: ["text", "image", "audio", "video"],
+      max_context_window: 1048576,
+      max_tokens: 65536,
+      supported_reasoning_levels: [{ effort: "high" }],
+      input_modalities: ["text", "image", "audio", "video"],
     };
     const [model] = normalizeCatalog([gemini], testConfig()).models;
     expect(model.contextWindow).toBe(1048576);
     expect(model.maxTokens).toBe(65536);
-    expect(model.reasoning).toBe(true);
-    // Host input types are limited to text and image; audio/video drop.
+    expect(model.thinking?.efforts).toEqual(["high"]);
     expect(model.input).toEqual(["text", "image"]);
   });
 
@@ -360,7 +325,6 @@ describe("OMP adapter", () => {
 
     const codex = byId.get("gpt-5.3-codex");
     expect(codex?.api).toBe("openai-codex-responses");
-    expect(codex?.preferWebsockets).toBeUndefined();
     expect(String(codex?.baseUrl)).toContain("?cliproxyapi-codex=");
     const compaction = codex?.remoteCompaction as Record<string, unknown>;
     expect(compaction.enabled).toBe(true);
@@ -381,16 +345,53 @@ describe("OMP adapter", () => {
     expect(url.search).toBe("?cliproxyapi-codex=");
   });
 
-  test("sends the Anthropic-Version header during discovery", async () => {
+  test("Pi discovery preserves exact slugs and applies supported capability hints", async () => {
     const host = new FakeHost();
-    const seen: { headers?: Headers } = {};
-    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
-    await activateOmp(host, environment, async (_input, init) => {
-      seen.headers = new Headers(init?.headers);
-      return makeModelsResponse([SPARSE_ENTRY]);
+    const astra = {
+      ...CODEX_ENTRY,
+      slug: "gpt-6-astra",
+      display_name: "GPT 6.0 Astra",
+      default_reasoning_level: "medium",
+      supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => ({ effort })),
+    };
+    await activateOmp(host, isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" }), async (input, init) => {
+      const url = new URL(String(input));
+      if (url.hostname === "models.dev") return new Response("{}");
+      if (url.pathname === "/v1/models" && !url.search) return new Response('{"data":[]}');
+      const headers = new Headers(init?.headers);
+      if (url.pathname !== "/v1/models" || url.searchParams.get("client_version") !== "pi" ||
+        headers.has("Anthropic-Version") || headers.get("Authorization") !== "Bearer abc") {
+        return new Response("wrong model-list protocol", { status: 400 });
+      }
+      return makeModelsResponse([
+        astra,
+        { ...astra, slug: "GPT-6 Astra", display_name: "gpt-6-astra", prefer_websockets: false },
+        { ...KIMI_ENTRY, prefer_websockets: true, use_responses_lite: true },
+      ]);
     });
-    expect(seen.headers?.get("anthropic-version")).toBe("2023-06-01");
-    expect(seen.headers?.get("authorization")).toBe("Bearer abc");
+    const models = host.providers[0].config.models;
+    const canonical = models.find((model) => model.id === "gpt-6-astra")!;
+    expect(canonical.name).toBe("GPT 6.0 Astra");
+    expect(canonical.input).toEqual(["text", "image"]);
+    expect(canonical.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(canonical.thinking?.defaultLevel).toBe("medium");
+    expect(canonical.preferWebsockets).toBe(true);
+    expect(canonical.useResponsesLite).toBe(false);
+    const alias = models.find((model) => model.id === "GPT-6 Astra")!;
+    expect(alias.name).toBe("gpt-6-astra");
+    expect(alias.api).toBe("openai-completions");
+    const kimi = models.find((model) => model.id === KIMI_ENTRY.slug)!;
+    expect(kimi.api).toBe("openai-completions");
+    expect(kimi.preferWebsockets).toBeUndefined();
+    expect(kimi.useResponsesLite).toBeUndefined();
+  });
+
+  test("an explicit false WebSocket preference survives Codex registration", async () => {
+    const host = new FakeHost();
+    await activateOmp(host, isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" }), async () =>
+      makeModelsResponse([{ ...CODEX_ENTRY, prefer_websockets: false }]),
+    );
+    expect(host.providers[0].config.models[0].preferWebsockets).toBe(false);
   });
 
   test("continues without provider when discovery fails", async () => {
@@ -470,13 +471,12 @@ describe("OMP adapter", () => {
 });
 
 describe("models.dev enrichment and overrides", () => {
-  /** Sparse entry as produced by CPA's openai-compatibility provider without extra config. */
+  /** Sparse Pi entry with owner metadata joined from the ordinary listing. */
   const COMPAT_ENTRY = {
-    id: "glm-4.7",
-    type: "openai-compatibility",
+    slug: "glm-4.7",
     display_name: "GLM 4.7",
     owned_by: "zhipu",
-    thinking: { levels: ["low", "medium", "high"] },
+    supported_reasoning_levels: ["low", "medium", "high"].map((effort) => ({ effort })),
   };
 
   function makeModelsDevResponse(providers: Record<string, Record<string, unknown>>): Response {
@@ -514,7 +514,7 @@ models:
     expect(model.maxTokens).toBe(4096);
   });
 
-  test("models.dev fills gaps only on openai-compatibility models", () => {
+  test("models.dev enriches matching providers while unmatched entries retain Pi metadata", () => {
     const index: ModelsDevIndex = {
       "zhipu/glm47": { contextWindow: 204800, maxTokens: 131072, input: ["text", "image"] },
       "zhipu/claudeopus46": { contextWindow: 999 },
@@ -526,11 +526,11 @@ models:
     expect(claude.contextWindow).toBe(200000);
   });
 
-  test("CPA config metadata wins over models.dev per field", () => {
-    const entry = { ...COMPAT_ENTRY, context_length: 111000 };
+  test("models.dev metadata takes priority over Pi values", () => {
+    const entry = { ...COMPAT_ENTRY, context_window: 111000 };
     const index: ModelsDevIndex = { "zhipu/glm47": { contextWindow: 204800, maxTokens: 131072 } };
     const [model] = normalizeCatalog([entry], testConfig(), index).models;
-    expect(model.contextWindow).toBe(111000);
+    expect(model.contextWindow).toBe(204800);
     expect(model.maxTokens).toBe(131072);
   });
 
@@ -549,7 +549,7 @@ models:
     const [byId] = normalizeCatalog([COMPAT_ENTRY], testConfig(), index).models;
     expect(byId.contextWindow).toBe(222);
     const [byName] = normalizeCatalog(
-      [{ ...COMPAT_ENTRY, id: "custom-alias" }],
+      [{ ...COMPAT_ENTRY, slug: "custom-alias" }],
       testConfig(),
       index,
     ).models;
@@ -562,7 +562,7 @@ models:
     const index: ModelsDevIndex = { "somewhiteglove/deepseekv32": { contextWindow: 999 } };
     const entry = {
       ...COMPAT_ENTRY,
-      id: "deepseek-v3.2",
+      slug: "deepseek-v3.2",
       display_name: "DeepSeek V3.2",
       owned_by: "deepseek",
     };
@@ -587,7 +587,10 @@ models:
           },
         });
       }
-      return makeModelsResponse([COMPAT_ENTRY, CLAUDE_ENTRY]);
+      if (new URL(String(input)).pathname === "/v1/models" && !new URL(String(input)).search) {
+        return new Response(JSON.stringify({ data: [{ id: COMPAT_ENTRY.slug, owned_by: "zhipu" }] }));
+      }
+      return makeModelsResponse([{ ...COMPAT_ENTRY, owned_by: undefined }, CLAUDE_ENTRY]);
     };
 
     const first = await tryDiscoverModels(environment, fetcher);
@@ -605,7 +608,41 @@ models:
     expect(modelsDevCalls).toBe(0);
   });
 
-  test("falls back to a stale models.dev cache when the network fails", async () => {
+  test("six-hour-old cache loads before refresh and the next discovery sees refreshed metadata", async () => {
+    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
+    const cachePath = join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json");
+    writeFileSync(cachePath, JSON.stringify({
+      fetchedAt: Date.now() - 6 * 60 * 60 * 1000,
+      index: { "zhipu/glm47": { contextWindow: 123456 } },
+    }));
+    let release!: (response: Response) => void;
+    const refresh = new Promise<Response>((resolve) => { release = resolve; });
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+      if (String(input).includes("models.dev")) return refresh;
+      return makeModelsResponse([COMPAT_ENTRY]);
+    };
+    let settled = false;
+    const discovery = tryDiscoverModels(environment, fetcher).then((result) => {
+      settled = true;
+      return result;
+    });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(true);
+      expect((await discovery)?.catalog.models[0].contextWindow).toBe(123456);
+    } finally {
+      release(makeModelsDevResponse({ zhipu: { "glm-4.7": { limit: { context: 204800 } } } }));
+      await discovery;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const next = await tryDiscoverModels(environment, async (input) => {
+      if (String(input).includes("models.dev")) throw new Error("fresh cache must not require a fetch");
+      return makeModelsResponse([COMPAT_ENTRY]);
+    });
+    expect(next?.catalog.models[0].contextWindow).toBe(204800);
+  });
+
+  test("keeps a stale models.dev cache when background refresh fails", async () => {
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
     writeFileSync(
       join(environment.PI_CODING_AGENT_DIR, "cliproxyapi.models-dev.cache.json"),
@@ -621,18 +658,28 @@ models:
     expect(discovery?.catalog.models[0]?.contextWindow).toBe(123456);
   });
 
-  test("skips the models.dev fetch when no compat models are present", async () => {
+  test("models.dev replaces Pi template capabilities and falls back per missing field", async () => {
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
-    let modelsDevCalls = 0;
     const discovery = await tryDiscoverModels(environment, async (input) => {
       if (String(input).includes("models.dev")) {
-        modelsDevCalls += 1;
-        throw new Error("should not fetch");
+        return makeModelsDevResponse({ anthropic: {
+          "claude-opus-4-6": {
+            limit: { context: 300000 },
+            modalities: { input: ["text"] },
+            reasoning: false,
+            tool_call: false,
+          },
+        } });
       }
-      return makeModelsResponse([CLAUDE_ENTRY]);
+      return makeModelsResponse([{ ...CLAUDE_ENTRY, owned_by: "anthropic" }]);
     });
-    expect(discovery?.catalog.models).toHaveLength(1);
-    expect(modelsDevCalls).toBe(0);
+    const model = discovery?.catalog.models[0];
+    expect(model?.contextWindow).toBe(300000);
+    expect(model?.maxTokens).toBe(CLAUDE_ENTRY.max_tokens);
+    expect(model?.input).toEqual(["text"]);
+    expect(model?.reasoning).toBe(false);
+    expect(model?.thinking).toBeUndefined();
+    expect(model?.supportsTools).toBe(false);
   });
 });
 
