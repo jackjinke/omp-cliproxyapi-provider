@@ -70,7 +70,6 @@ function buildOmpModels(models: CPAModel[], config: CPAConfig): OmpProviderModel
         ...model,
         api: "openai-codex-responses",
         baseUrl: codexBaseUrl(config.baseUrl),
-        preferWebsockets: false,
         // OMP enriches known Codex ids (gpt-5.6-luna/sol/terra, gpt-6-astra)
         // from its bundled catalog, which flags them useResponsesLite. The
         // lite path then ignores this model's baseUrl and reuses the host's

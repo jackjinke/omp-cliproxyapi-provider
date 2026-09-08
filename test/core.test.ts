@@ -360,7 +360,7 @@ describe("OMP adapter", () => {
 
     const codex = byId.get("gpt-5.3-codex");
     expect(codex?.api).toBe("openai-codex-responses");
-    expect(codex?.preferWebsockets).toBe(false);
+    expect(codex?.preferWebsockets).toBeUndefined();
     expect(String(codex?.baseUrl)).toContain("?cliproxyapi-codex=");
     const compaction = codex?.remoteCompaction as Record<string, unknown>;
     expect(compaction.enabled).toBe(true);
