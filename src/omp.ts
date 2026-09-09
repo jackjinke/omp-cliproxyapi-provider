@@ -8,6 +8,7 @@ import {
 export interface OmpExtensionAPI {
   registerProvider(name: string, config: OmpProviderConfig): void;
   getThinkingLevel(): string;
+  setThinkingLevel(level: string): void;
   setModel(model: unknown): Promise<boolean>;
   on(event: string, handler: (event: unknown, context: unknown) => unknown): void;
 }
@@ -130,7 +131,7 @@ export async function activateOmp(
    * sessions in a long-lived host brings in another unreconciled model object,
    * so the same rebind runs on session_switch.
    */
-  function rebindStartupModel(_event: unknown, context: unknown): void {
+  async function rebindStartupModel(_event: unknown, context: unknown): Promise<void> {
     const ctx = context as { model?: unknown };
     const identity = extractModelIdentity(ctx?.model);
     if (!identity || identity.provider !== PROVIDER_NAME || !identity.id) return;
@@ -142,8 +143,13 @@ export async function activateOmp(
     // Fields the built model does not define must not survive from the
     // provisional variant — a foreign codex baseUrl is the known case.
     if (builtModel.baseUrl === undefined) delete target.baseUrl;
-    target[discoveryStamp] = true;
-    void api.setModel(ctx.model).catch(() => {});
+    // setModel applies the catalog default; hydration must retain the session's effort.
+    const level = api.getThinkingLevel();
+    try {
+      if (await api.setModel(ctx.model)) target[discoveryStamp] = true;
+    } finally {
+      api.setThinkingLevel(level);
+    }
   }
 
   api.on("session_start", rebindStartupModel);

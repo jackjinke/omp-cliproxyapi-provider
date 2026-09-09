@@ -34,8 +34,20 @@ class FakeHost implements OmpExtensionAPI {
     return this.thinkingLevel;
   }
 
+  setThinkingLevel(level: string): void {
+    this.thinkingLevel = level;
+  }
+
   async setModel(model: unknown): Promise<boolean> {
     this.setModelCalls.push(model);
+    await Promise.resolve();
+    if (model && typeof model === "object" && "thinking" in model) {
+      const thinking = model.thinking;
+      if (thinking && typeof thinking === "object" && "defaultLevel" in thinking &&
+          typeof thinking.defaultLevel === "string") {
+        this.setThinkingLevel(thinking.defaultLevel);
+      }
+    }
     return true;
   }
 
@@ -403,6 +415,21 @@ describe("OMP adapter", () => {
       throw new Error("connection refused");
     });
     expect(host.providers).toHaveLength(0);
+  });
+
+  test("lifecycle rebinds preserve session effort instead of applying the catalog default", async () => {
+    const host = new FakeHost();
+    await activateOmp(host, isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" }), async () =>
+      makeModelsResponse([{ ...CODEX_ENTRY, default_reasoning_level: "medium" }]),
+    );
+    host.setThinkingLevel("xhigh");
+    await host.emit("session_start", fakeContext({ provider: "cliproxyapi", id: CODEX_ENTRY.slug }));
+    expect(host.getThinkingLevel()).toBe("xhigh");
+
+    host.setThinkingLevel("low");
+    await host.emit("session_switch", fakeContext({ provider: "cliproxyapi", id: CODEX_ENTRY.slug }));
+    expect(host.getThinkingLevel()).toBe("low");
+    expect(host.providers[0].config.models[0].thinking?.defaultLevel).toBe("medium");
   });
 
   test("hydrates a provisional startup model from the catalog", async () => {
