@@ -325,7 +325,7 @@ describe("OMP adapter", () => {
 
     const codex = byId.get("gpt-5.3-codex");
     expect(codex?.api).toBe("openai-codex-responses");
-    expect(String(codex?.baseUrl)).toContain("?cliproxyapi-codex=");
+    expect(String(codex?.baseUrl)).toContain("?via=");
     const compaction = codex?.remoteCompaction as Record<string, unknown>;
     expect(compaction.enabled).toBe(true);
     expect(compaction.v2StreamingEnabled).toBe(true);
@@ -342,7 +342,7 @@ describe("OMP adapter", () => {
     expect(url.pathname).toBe("/v1/responses");
     // pi-ai appends /codex/responses after this base; parked in the query it
     // never reaches CPA's router as a path segment.
-    expect(url.search).toBe("?cliproxyapi-codex=");
+    expect(url.search).toBe("?via=");
   });
 
   test("Pi discovery preserves exact slugs and applies supported capability hints", async () => {
@@ -428,7 +428,7 @@ describe("OMP adapter", () => {
       baseUrl: "http://or.sorcery.link:20128/v1/responses?omniroute-codex=",
     };
     await host.emit("session_start", fakeContext(provisional));
-    expect(String(provisional.baseUrl)).toContain("?cliproxyapi-codex=");
+    expect(String(provisional.baseUrl)).toContain("?via=");
     expect(provisional.api).toBe("openai-codex-responses");
     expect(host.setModelCalls).toHaveLength(1);
   });

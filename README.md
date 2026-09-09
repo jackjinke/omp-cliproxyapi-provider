@@ -17,7 +17,7 @@
   connection hints:
   - Claude models → `anthropic-messages` against CPA's `/v1/messages`.
   - Codex/GPT models → `openai-codex-responses` with V2 streaming remote compaction. The base URL ends
-    in `?cliproxyapi-codex=` so pi-ai's `/codex/responses` suffix stays in the query string and requests
+    in `?via=` so pi-ai's `/codex/responses` suffix stays in the query string and requests
     reach CPA's `/v1/responses`. `prefer_websockets` is honored; OMP handles SSE fallback.
     Responses Lite remains explicitly disabled even when CPA advertises it.
   - Other models → `openai-completions`. Arbitrary model aliases do not reliably identify a protocol;

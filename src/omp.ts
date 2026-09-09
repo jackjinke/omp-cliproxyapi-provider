@@ -45,7 +45,7 @@ interface OmpModelIdentity {
  * `/v1/responses` endpoint.
  */
 function codexBaseUrl(baseUrl: string): string {
-  return `${baseUrl}/v1/responses?cliproxyapi-codex=`;
+  return `${baseUrl}/v1/responses?via=`;
 }
 
 /**
