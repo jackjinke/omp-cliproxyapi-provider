@@ -92,8 +92,6 @@ function testConfig(overrides: Partial<CPAConfig> = {}): CPAConfig {
     apiKey: "test-key",
     baseUrl: "http://127.0.0.1:8317",
     startupTimeoutMs: 15000,
-    codexTransport: new Set(),
-    effortOverrides: {},
     modelOverrides: {},
     ...overrides,
   };
@@ -154,19 +152,23 @@ describe("shared catalog logic", () => {
     expect(() => readConfig(isolatedEnv())).toThrow("CLIPROXYAPI_API_KEY is required");
   });
 
-  test("reads codex transport and effort overrides from yaml", () => {
+  test("reads model overrides from yaml", () => {
     const environment = envWithConfig(
       [
-        "codex_transport: [combo/coding]",
-        '"*": [low, medium]',
-        "kimi-k3-256k: [low, high]",
+        "models:",
+        "  combo/coding:",
+        "    codex_transport: true",
+        "  \"*\":",
+        "    efforts: [low, medium]",
+        "  kimi-k3-256k:",
+        "    efforts: [low, high]",
       ].join("\n"),
       { CLIPROXYAPI_API_KEY: "abc" },
     );
     const config = readConfig(environment);
-    expect(config.codexTransport.has("combo/coding")).toBe(true);
-    expect(config.effortOverrides["*"]).toEqual(["low", "medium"]);
-    expect(config.effortOverrides["kimi-k3-256k"]).toEqual(["low", "high"]);
+    expect(config.modelOverrides["combo/coding"]?.codexTransport).toBe(true);
+    expect(config.modelOverrides["*"]?.efforts).toEqual(["low", "medium"]);
+    expect(config.modelOverrides["kimi-k3-256k"]?.efforts).toEqual(["low", "high"]);
   });
 
   test("normalizes Pi catalog capabilities", () => {
@@ -212,7 +214,7 @@ describe("shared catalog logic", () => {
   });
 
   test("applies effort overrides as additive extras", () => {
-    const config = testConfig({ effortOverrides: { "*": ["minimal"] } });
+    const config = testConfig({ modelOverrides: { "*": { efforts: ["minimal"] } } });
     const [model] = normalizeCatalog([CLAUDE_ENTRY], config).models;
     expect(model.thinking?.efforts).toEqual(["low", "medium", "high", "max", "minimal"]);
   });
@@ -234,8 +236,8 @@ describe("shared catalog logic", () => {
     expect(extractCPAModel(bare("glm-5"), config)?.isClaude).toBe(false);
   });
 
-  test("honors codex_transport opt-in list", () => {
-    const config = testConfig({ codexTransport: new Set(["custom/o3-pool"]) });
+  test("honors per-model codex_transport opt-in", () => {
+    const config = testConfig({ modelOverrides: { "custom/o3-pool": { codexTransport: true } } });
     expect(extractCPAModel({ slug: "custom/o3-pool" }, config)?.isCodex).toBe(true);
   });
 
@@ -268,14 +270,14 @@ describe("shared catalog logic", () => {
   });
 
   test("an exact-id effort override opts a model into reasoning", () => {
-    const config = testConfig({ effortOverrides: { "deepseek-v3.2": ["low", "high"] } });
+    const config = testConfig({ modelOverrides: { "deepseek-v3.2": { efforts: ["low", "high"] } } });
     const [model] = normalizeCatalog([SPARSE_ENTRY], config).models;
     expect(model.reasoning).toBe(true);
     expect(model.thinking?.efforts).toEqual(["low", "high"]);
   });
 
   test("wildcard effort overrides do not invent reasoning", () => {
-    const config = testConfig({ effortOverrides: { "*": ["low"] } });
+    const config = testConfig({ modelOverrides: { "*": { efforts: ["low"] } } });
     const [model] = normalizeCatalog([SPARSE_ENTRY], config).models;
     expect(model.reasoning).toBe(false);
   });

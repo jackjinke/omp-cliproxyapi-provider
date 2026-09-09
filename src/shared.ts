@@ -44,6 +44,8 @@ export interface CPACatalog {
  * extending this interface and OVERRIDABLE_MODEL_FIELDS together.
  */
 export interface CPAModelOverride {
+  codexTransport?: boolean;
+  efforts?: string[];
   contextWindow?: number;
   maxTokens?: number;
 }
@@ -52,8 +54,6 @@ export interface CPAConfig {
   apiKey: string;
   baseUrl: string;
   startupTimeoutMs: number;
-  codexTransport: Set<string>;
-  effortOverrides: Record<string, string[]>;
   modelOverrides: Record<string, CPAModelOverride>;
 }
 
@@ -122,8 +122,6 @@ export function readConfig(
     apiKey,
     baseUrl: (environment.CLIPROXYAPI_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
     startupTimeoutMs: normalizeTimeout(environment.CLIPROXYAPI_STARTUP_TIMEOUT_MS),
-    codexTransport: new Set(),
-    effortOverrides: {},
     modelOverrides: {},
   };
 
@@ -138,20 +136,9 @@ export function readConfig(
           config.modelOverrides = parseModelOverrides(value);
           continue;
         }
-        if (normalizedKey === "codex_transport") {
-          if (Array.isArray(value)) {
-            for (const entry of value) {
-              const id = String(entry).trim();
-              if (id) config.codexTransport.add(id);
-            }
-          }
-          continue;
         }
-        const efforts = normalizeEfforts(value);
-        if (efforts.length > 0) config.effortOverrides[normalizedKey] = efforts;
       }
     }
-  }
 
   return config;
 }
@@ -173,6 +160,10 @@ function parseModelOverrides(value: unknown): Record<string, CPAModelOverride> {
     const id = modelId.trim();
     if (!id || !fields || typeof fields !== "object" || Array.isArray(fields)) continue;
     const override: CPAModelOverride = {};
+    const codexTransport = (fields as Record<string, unknown>).codex_transport;
+    if (typeof codexTransport === "boolean") override.codexTransport = codexTransport;
+    const efforts = normalizeEfforts((fields as Record<string, unknown>).efforts);
+    if (efforts.length > 0) override.efforts = efforts;
     for (const field of OVERRIDABLE_MODEL_FIELDS) {
       const parsed = Number((fields as Record<string, unknown>)[field]);
       if (Number.isFinite(parsed) && parsed > 0) override[field] = Math.floor(parsed);
@@ -482,7 +473,7 @@ function parseEfforts(
   config: CPAConfig,
   id: string,
 ): string[] {
-  const override = config.effortOverrides[id] ?? config.effortOverrides["*"];
+  const override = config.modelOverrides[id]?.efforts ?? config.modelOverrides["*"]?.efforts;
   if (!Array.isArray(entry.supported_reasoning_levels)) {
     return override && override.length > 0 ? override : [...DEFAULT_EFFORTS];
   }
@@ -520,11 +511,10 @@ export function extractCPAModel(
     id.startsWith("gpt-") ||
     id.startsWith("codex-") ||
     id.includes("/gpt-") ||
-    config.codexTransport.has(id);
-
+    config.modelOverrides[id]?.codexTransport === true;
   // Explicit empty effort lists must not acquire fallback levels. Image models
   // can inherit a Codex template's effort list without supporting reasoning.
-  const reasoning = config.effortOverrides[id] !== undefined || (
+  const reasoning = config.modelOverrides[id]?.efforts !== undefined || (
     metadata?.reasoning ?? (!id.startsWith("gpt-image") && (
       firstArray(entry.supported_reasoning_levels).length > 0 ||
       (isCodex && !Array.isArray(entry.supported_reasoning_levels))
