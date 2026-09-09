@@ -140,9 +140,9 @@ export async function activateOmp(
     const target = ctx.model as Record<PropertyKey, unknown>;
     if (target[discoveryStamp]) return;
     Object.assign(target, builtModel);
-    // Fields the built model does not define must not survive from the
-    // provisional variant — a foreign codex baseUrl is the known case.
-    if (builtModel.baseUrl === undefined) delete target.baseUrl;
+    // Replace foreign URLs with the provider endpoint; an absent URL lets the
+    // host fall back to the upstream endpoint while still sending the CPA key.
+    if (builtModel.baseUrl === undefined) target.baseUrl = `${config.baseUrl}/v1`;
     // setModel applies the catalog default; hydration must retain the session's effort.
     const level = api.getThinkingLevel();
     try {

@@ -462,18 +462,33 @@ describe("OMP adapter", () => {
     expect(host.setModelCalls).toHaveLength(1);
   });
 
-  test("rebind drops a foreign baseUrl when the built model has none", async () => {
+  test.each([KIMI_ENTRY, CLAUDE_ENTRY])("rebind keeps $slug routed to the proxy", async (entry) => {
     const host = new FakeHost();
-    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
-    await activateOmp(host, environment, async () => makeModelsResponse([KIMI_ENTRY]));
-    const provisional: FakeContextModel = {
+    const baseUrl = "http://proxy.example:8317";
+    const environment = isolatedEnv({
+      CLIPROXYAPI_API_KEY: "abc",
+      CLIPROXYAPI_BASE_URL: baseUrl,
+    });
+    await activateOmp(host, environment, async () => makeModelsResponse([entry]));
+    const resumed: FakeContextModel = {
       provider: "cliproxyapi",
-      id: "kimi-k3-256k",
-      baseUrl: "http://or.sorcery.link:20128/v1",
+      id: entry.slug,
+      baseUrl: `${baseUrl}/v1`,
     };
-    await host.emit("session_start", fakeContext(provisional));
-    expect(provisional.baseUrl).toBeUndefined();
-    expect(provisional.api).toBe("openai-completions");
+    await host.emit("session_start", fakeContext(resumed));
+    expect(resumed.baseUrl).toBe(`${baseUrl}/v1`);
+
+    const switched: FakeContextModel = {
+      provider: "cliproxyapi",
+      id: entry.slug,
+      baseUrl: "http://foreign.example/v1/responses?via=",
+    };
+    await host.emit("session_switch", fakeContext(switched));
+    expect(switched.baseUrl).toBe(`${baseUrl}/v1`);
+
+    const provisional: FakeContextModel = { provider: "cliproxyapi", id: entry.slug };
+    await host.emit("session_switch", fakeContext(provisional));
+    expect(provisional.baseUrl).toBe(`${baseUrl}/v1`);
   });
 
   test("ignores startup models from other providers", async () => {
