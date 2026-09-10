@@ -19,7 +19,17 @@ export CLIPROXYAPI_BASE_URL='http://127.0.0.1:8317' # optional
 
 These variables can also be placed in `~/.omp/agent/.env`. The base URL defaults to `http://127.0.0.1:8317`.
 
-The optional `~/.omp/agent/cliproxyapi.yml` file configures Codex transport opt-ins and per-model overrides:
+The optional `~/.omp/agent/cliproxyapi.yml` file configures Codex transport opt-ins and per-model overrides. A bare model name applies to that model with or without a provider prefix; a provider-specific entry takes priority:
+
+```yaml
+models:
+  gpt-5:
+    contextWindow: 128000
+  openai/gpt-5:
+    contextWindow: 200000
+```
+
+Here the first override applies to `gpt-5` and other prefixed variants, while `openai/gpt-5` uses the provider-specific value.
 
 ```yaml
 models:

@@ -549,13 +549,23 @@ models:
     expect(config.modelOverrides["*"]).toEqual({ contextWindow: 100000 });
   });
 
-  test("overrides apply to first-party channels and merge wildcard with exact", () => {
+  test("bare model overrides apply to prefixed IDs before exact overrides", () => {
     const config = testConfig({
-      modelOverrides: { "*": { maxTokens: 4096 }, "claude-opus-4-6": { contextWindow: 150000 } },
+      modelOverrides: {
+        "model-name": { contextWindow: 100000, maxTokens: 12000 },
+        "provider/model-name": { contextWindow: 200000 },
+      },
     });
-    const [model] = normalizeCatalog([CLAUDE_ENTRY], config).models;
-    expect(model.contextWindow).toBe(150000);
-    expect(model.maxTokens).toBe(4096);
+    const [bare, prefixed, exact] = normalizeCatalog([
+      { slug: "model-name" },
+      { slug: "other/model-name" },
+      { slug: "provider/model-name" },
+    ], config).models;
+    expect(bare.contextWindow).toBe(100000);
+    expect(prefixed.contextWindow).toBe(100000);
+    expect(prefixed.maxTokens).toBe(12000);
+    expect(exact.contextWindow).toBe(200000);
+    expect(exact.maxTokens).toBe(12000);
   });
 
   test("models.dev enriches matching providers while unmatched entries retain Pi metadata", () => {

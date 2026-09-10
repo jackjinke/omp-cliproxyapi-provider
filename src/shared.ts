@@ -468,12 +468,21 @@ function normalizeInputModalities(value: unknown): ("text" | "image")[] {
   return modalities.length > 0 ? [...new Set(modalities)] : ["text"];
 }
 
+function modelOverride(config: CPAConfig, id: string): CPAModelOverride {
+  const basename = id.slice(id.lastIndexOf("/") + 1);
+  return {
+    ...config.modelOverrides["*"],
+    ...config.modelOverrides[basename],
+    ...config.modelOverrides[id],
+  };
+}
+
 function parseEfforts(
   entry: Record<string, unknown>,
   config: CPAConfig,
   id: string,
 ): string[] {
-  const override = config.modelOverrides[id]?.efforts ?? config.modelOverrides["*"]?.efforts;
+  const override = modelOverride(config, id).efforts;
   if (!Array.isArray(entry.supported_reasoning_levels)) {
     return override && override.length > 0 ? override : [...DEFAULT_EFFORTS];
   }
@@ -482,10 +491,7 @@ function parseEfforts(
 }
 
 function applyModelOverrides(model: CPAModel, config: CPAConfig): void {
-  const merged: CPAModelOverride = {
-    ...config.modelOverrides["*"],
-    ...config.modelOverrides[model.id],
-  };
+  const merged = modelOverride(config, model.id);
   for (const field of OVERRIDABLE_MODEL_FIELDS) {
     const value = merged[field];
     if (value !== undefined) model[field] = value;
@@ -505,16 +511,20 @@ export function extractCPAModel(
     modelsDev[`${owner}/${normalizeModelsDevKey(id)}`] ??
     modelsDev[`${owner}/${normalizeModelsDevKey(name)}`]
   ) : undefined;
-
+  const override = modelOverride(config, id);
+  const modelName = id.slice(id.lastIndexOf("/") + 1);
+  const hasExplicitEfforts =
+    config.modelOverrides[id]?.efforts !== undefined ||
+    config.modelOverrides[modelName]?.efforts !== undefined;
   const isClaude = id.startsWith("claude-");
   const isCodex =
     id.startsWith("gpt-") ||
     id.startsWith("codex-") ||
     id.includes("/gpt-") ||
-    config.modelOverrides[id]?.codexTransport === true;
+    override.codexTransport === true;
   // Explicit empty effort lists must not acquire fallback levels. Image models
   // can inherit a Codex template's effort list without supporting reasoning.
-  const reasoning = config.modelOverrides[id]?.efforts !== undefined || (
+  const reasoning = hasExplicitEfforts || (
     metadata?.reasoning ?? (!id.startsWith("gpt-image") && (
       firstArray(entry.supported_reasoning_levels).length > 0 ||
       (isCodex && !Array.isArray(entry.supported_reasoning_levels))
