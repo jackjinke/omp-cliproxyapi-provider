@@ -1,6 +1,7 @@
 import {
   cliproxyapiConfigPath,
-  tryDiscoverModels,
+  discoverModels,
+  readConfig,
   type CPAConfig,
   type CPAModel,
 } from "./shared.ts";
@@ -102,9 +103,28 @@ export async function activateOmp(
   environment: Record<string, string | undefined> = process.env,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
 ): Promise<void> {
-  const discovery = await tryDiscoverModels(environment, fetcher, cliproxyapiConfigPath(environment));
-  if (!discovery) return;
-  const { config, catalog } = discovery;
+  if (!environment.CLIPROXYAPI_API_KEY?.trim()) return;
+  const configPath = cliproxyapiConfigPath(environment);
+  const config = readConfig(environment, configPath);
+  // Discovery is optional; a failed catalog refresh must not remove authentication.
+  const provider: OmpProviderConfig = {
+    name: "CLIProxyAPI",
+    baseUrl: `${config.baseUrl}/v1`,
+    apiKey: config.apiKey,
+    api: GENERIC_API,
+    models: [],
+  };
+  api.registerProvider(PROVIDER_NAME, provider);
+
+  let ompModels: OmpProviderModel[];
+  try {
+    const catalog = await discoverModels(config, fetcher, configPath);
+    ompModels = buildOmpModels(catalog.models, config);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[cliproxyapi] model discovery failed; authentication remains registered: ${message}`);
+    return;
+  }
 
   const discoveryStamp = Symbol("cliproxyapi.discovered");
   // Cache the built host models — including per-model api/baseUrl/compaction —
@@ -112,16 +132,9 @@ export async function activateOmp(
   // provisional startup model can inherit a recently-used same-id variant from
   // another provider (e.g. omniroute's codex baseUrl), and assigning only
   // catalog metadata leaves that polluted baseUrl in place.
-  const ompModels = buildOmpModels(catalog.models, config);
   const modelCache = new Map<string, OmpProviderModel>(ompModels.map((model) => [model.id, model]));
 
-  api.registerProvider(PROVIDER_NAME, {
-    name: "CLIProxyAPI",
-    baseUrl: `${config.baseUrl}/v1`,
-    apiKey: config.apiKey,
-    api: GENERIC_API,
-    models: ompModels,
-  });
+  api.registerProvider(PROVIDER_NAME, { ...provider, models: ompModels });
 
   /**
    * Startup model selection happens before extension providers register, so a

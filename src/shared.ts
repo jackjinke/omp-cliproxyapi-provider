@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -173,112 +172,41 @@ function parseModelOverrides(value: unknown): Record<string, CPAModelOverride> {
   return overrides;
 }
 
-async function fetchEntriesOnce(
-  config: CPAConfig,
-  path: string,
-  listKey: "models" | "data",
+async function fetchJson(
+  url: string,
+  timeoutMs: number,
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
-): Promise<unknown[]> {
-  const response = await fetcher(`${config.baseUrl}${path}`, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`CLIProxyAPI ${path} failed with HTTP ${response.status}`);
-  }
-  const payload = (await response.json()) as Record<string, unknown>;
-  return firstArray(payload?.[listKey]);
-}
-
-async function fetchWithTimeout(
-  config: CPAConfig,
-  path: string,
-  listKey: "models" | "data",
-  fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
-): Promise<unknown[]> {
-  let timeout: NodeJS.Timeout | undefined;
+  apiKey?: string,
+): Promise<unknown> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new Error(`Catalog request timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
   try {
-    return await Promise.race([
-      fetchEntriesOnce(config, path, listKey, fetcher),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(
-          () => reject(new Error(`CLIProxyAPI ${path} timed out after ${config.startupTimeoutMs}ms`)),
-          config.startupTimeoutMs,
-        );
-      }),
-    ]);
+    const response = await fetcher(url, {
+      headers: {
+        Accept: "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Catalog request failed with HTTP ${response.status}`);
+    return await response.json();
   } finally {
     clearTimeout(timeout);
+    controller.abort();
   }
 }
 
-async function fetchViaCurl(config: CPAConfig, path: string, listKey: "models" | "data"): Promise<unknown[]> {
-  return await new Promise<unknown[]>((resolve, reject) => {
-    const child = spawn(
-      "curl",
-      [
-        "-sS",
-        "-m",
-        String(Math.max(1, Math.ceil(config.startupTimeoutMs / 1000))),
-        "-H",
-        `Authorization: Bearer ${config.apiKey}`,
-        "-H",
-        "Accept: application/json",
-        `${config.baseUrl}${path}`,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", reject);
-    child.once("close", (code: number | null) => {
-      if (code !== 0) {
-        reject(new Error(stderr.trim() || `curl exited with code ${code ?? "unknown"}`));
-        return;
-      }
-      try {
-        const payload = JSON.parse(stdout) as Record<string, unknown>;
-        resolve(firstArray(payload?.[listKey]));
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-  });
-}
-
-async function fetchEntriesWithRecovery(
+async function fetchEntries(
   config: CPAConfig,
   path: string,
   listKey: "models" | "data",
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ): Promise<unknown[]> {
-  try {
-    return await fetchWithTimeout(config, path, listKey, fetcher);
-  } catch (error) {
-    if (!isRetryableDiscoveryError(error)) throw error;
-  }
-  try {
-    return await fetchWithTimeout(config, path, listKey, fetcher);
-  } catch (error) {
-    if (!isRetryableDiscoveryError(error)) throw error;
-  }
-  return await fetchViaCurl(config, path, listKey);
-}
-
-function isRetryableDiscoveryError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return /unexpected token|JSON Parse error|failed to parse|timed out/i.test(error.message);
+  const payload = await fetchJson(`${config.baseUrl}${path}`, config.startupTimeoutMs, fetcher, config.apiKey);
+  return firstArray(firstRecord(payload)?.[listKey]);
 }
 
 function normalizeModelsDevKey(value: string): string {
@@ -352,18 +280,7 @@ async function refreshModelsDevIndex(
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ): Promise<ModelsDevIndex | null> {
   try {
-    let timeout: NodeJS.Timeout | undefined;
-    const response = await Promise.race([
-      fetcher(MODELS_DEV_URL, { headers: { Accept: "application/json" } }),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(
-          () => reject(new Error(`models.dev catalog timed out after ${config.startupTimeoutMs}ms`)),
-          config.startupTimeoutMs,
-        );
-      }),
-    ]).finally(() => clearTimeout(timeout));
-    if (!response.ok) throw new Error(`models.dev catalog failed with HTTP ${response.status}`);
-    const index = indexModelsDevPayload(await response.json());
+    const index = indexModelsDevPayload(await fetchJson(MODELS_DEV_URL, config.startupTimeoutMs, fetcher));
     try {
       mkdirSync(dirname(cachePath), { recursive: true });
       writeFileSync(cachePath, JSON.stringify({ fetchedAt: Date.now(), index } satisfies ModelsDevCacheFile));
@@ -384,7 +301,7 @@ async function loadModelOwners(
 ): Promise<Map<string, string>> {
   const owners = new Map<string, string>();
   try {
-    const entries = await fetchEntriesWithRecovery(config, "/v1/models", "data", fetcher);
+    const entries = await fetchEntries(config, "/v1/models", "data", fetcher);
     for (const value of entries) {
       const entry = firstRecord(value);
       const id = firstString(entry?.id);
@@ -403,7 +320,7 @@ export async function discoverModels(
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
   configPath?: string,
 ): Promise<CPACatalog> {
-  const payload = await fetchEntriesWithRecovery(config, "/v1/models?client_version=pi", "models", fetcher);
+  const payload = await fetchEntries(config, "/v1/models?client_version=pi", "models", fetcher);
   const entries = payload.filter((value): value is Record<string, unknown> => {
     const entry = firstRecord(value);
     return entry !== undefined && firstString(entry.slug) !== undefined;
@@ -579,40 +496,3 @@ export function normalizeCatalog(
   return { models };
 }
 
-export interface CPADiscovery {
-  config: CPAConfig;
-  catalog: CPACatalog;
-}
-
-/**
- * Loads config and discovers the catalog, returning null on any failure after
- * logging a warning. Hosts call this so a down CLIProxyAPI never blocks startup.
- */
-export async function tryDiscoverModels(
-  environment: Environment = process.env,
-  fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
-  configPath?: string,
-): Promise<CPADiscovery | null> {
-  const resolvedConfigPath = configPath ?? cliproxyapiConfigPath(environment);
-  let config: CPAConfig;
-  try {
-    config = readConfig(environment, resolvedConfigPath);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/CLIPROXYAPI_API_KEY is required/.test(message)) {
-      console.warn(`[cliproxyapi] ${message}`);
-    }
-    return null;
-  }
-
-  try {
-    const catalog = await discoverModels(config, fetcher, resolvedConfigPath);
-    return { config, catalog };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(
-      `[cliproxyapi] startup discovery failed; continuing without provider: ${message}`,
-    );
-    return null;
-  }
-}

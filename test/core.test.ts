@@ -8,7 +8,7 @@ import {
   extractCPAModel,
   normalizeCatalog,
   readConfig,
-  tryDiscoverModels,
+  discoverModels,
   type CPAConfig,
   type ModelsDevIndex,
 } from "../src/shared.ts";
@@ -27,7 +27,9 @@ class FakeHost implements OmpExtensionAPI {
   setModelCalls: unknown[] = [];
 
   registerProvider(name: string, config: OmpProviderConfig): void {
-    this.providers.push({ name, config });
+    const index = this.providers.findIndex((provider) => provider.name === name);
+    if (index === -1) this.providers.push({ name, config });
+    else this.providers[index] = { name, config };
   }
 
   getThinkingLevel(): string {
@@ -408,14 +410,6 @@ describe("OMP adapter", () => {
     expect(host.providers[0].config.models[0].preferWebsockets).toBe(false);
   });
 
-  test("continues without provider when discovery fails", async () => {
-    const host = new FakeHost();
-    const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
-    await activateOmp(host, environment, async () => {
-      throw new Error("connection refused");
-    });
-    expect(host.providers).toHaveLength(0);
-  });
 
   test("lifecycle rebinds preserve session effort instead of applying the catalog default", async () => {
     const host = new FakeHost();
@@ -647,8 +641,8 @@ models:
       return makeModelsResponse([{ ...COMPAT_ENTRY, owned_by: undefined }, CLAUDE_ENTRY]);
     };
 
-    const first = await tryDiscoverModels(environment, fetcher);
-    const glm = first?.catalog.models.find((model) => model.id === "glm-4.7");
+    const first = await discoverModels(readConfig(environment), fetcher, cliproxyapiConfigPath(environment));
+    const glm = first.models.find((model) => model.id === "glm-4.7");
     expect(glm?.contextWindow).toBe(204800);
     expect(glm?.maxTokens).toBe(131072);
     expect(modelsDevCalls).toBe(1);
@@ -657,8 +651,8 @@ models:
 
     // Second run within the TTL reads the cache without touching the network.
     modelsDevCalls = 0;
-    const second = await tryDiscoverModels(environment, fetcher);
-    expect(second?.catalog.models.find((model) => model.id === "glm-4.7")?.contextWindow).toBe(204800);
+    const second = await discoverModels(readConfig(environment), fetcher, cliproxyapiConfigPath(environment));
+    expect(second.models.find((model) => model.id === "glm-4.7")?.contextWindow).toBe(204800);
     expect(modelsDevCalls).toBe(0);
   });
 
@@ -677,24 +671,24 @@ models:
       return makeModelsResponse([COMPAT_ENTRY]);
     };
     let settled = false;
-    const discovery = tryDiscoverModels(environment, fetcher).then((result) => {
+    const discovery = discoverModels(readConfig(environment), fetcher, cliproxyapiConfigPath(environment)).then((result) => {
       settled = true;
       return result;
     });
     try {
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(settled).toBe(true);
-      expect((await discovery)?.catalog.models[0].contextWindow).toBe(123456);
+      expect((await discovery).models[0].contextWindow).toBe(123456);
     } finally {
       release(makeModelsDevResponse({ zhipu: { "glm-4.7": { limit: { context: 204800 } } } }));
       await discovery;
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    const next = await tryDiscoverModels(environment, async (input) => {
+    const next = await discoverModels(readConfig(environment), async (input) => {
       if (String(input).includes("models.dev")) throw new Error("fresh cache must not require a fetch");
       return makeModelsResponse([COMPAT_ENTRY]);
-    });
-    expect(next?.catalog.models[0].contextWindow).toBe(204800);
+    }, cliproxyapiConfigPath(environment));
+    expect(next.models[0].contextWindow).toBe(204800);
   });
 
   test("keeps a stale models.dev cache when background refresh fails", async () => {
@@ -707,16 +701,16 @@ models:
         index: { "zhipu/glm47": { contextWindow: 123456 } },
       }),
     );
-    const discovery = await tryDiscoverModels(environment, async (input) => {
+    const discovery = await discoverModels(readConfig(environment), async (input) => {
       if (String(input).includes("models.dev")) throw new Error("offline");
       return makeModelsResponse([COMPAT_ENTRY]);
-    });
-    expect(discovery?.catalog.models[0]?.contextWindow).toBe(123456);
+    }, cliproxyapiConfigPath(environment));
+    expect(discovery.models[0]?.contextWindow).toBe(123456);
   });
 
   test("models.dev replaces Pi template capabilities and falls back per missing field", async () => {
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });
-    const discovery = await tryDiscoverModels(environment, async (input) => {
+    const discovery = await discoverModels(readConfig(environment), async (input) => {
       if (String(input).includes("models.dev")) {
         return makeModelsDevResponse({ anthropic: {
           "claude-opus-4-6": {
@@ -728,8 +722,8 @@ models:
         } });
       }
       return makeModelsResponse([{ ...CLAUDE_ENTRY, owned_by: "anthropic" }]);
-    });
-    const model = discovery?.catalog.models[0];
+    }, cliproxyapiConfigPath(environment));
+    const model = discovery.models[0];
     expect(model?.contextWindow).toBe(300000);
     expect(model?.maxTokens).toBe(CLAUDE_ENTRY.max_tokens);
     expect(model?.input).toEqual(["text"]);
@@ -739,20 +733,17 @@ models:
   });
 });
 
-describe("tryDiscoverModels", () => {
-  test("returns null when the api key is missing", async () => {
-    const discovery = await tryDiscoverModels(isolatedEnv(), async () => {
+describe("discovery configuration", () => {
+  test("does not activate without a configured key", async () => {
+    const host = new FakeHost();
+    await activateOmp(host, isolatedEnv(), async () => {
       throw new Error("should not fetch");
     });
-    expect(discovery).toBeNull();
+    expect(host.providers).toHaveLength(0);
   });
 
-  test("returns null when the catalog is empty", async () => {
-    const discovery = await tryDiscoverModels(
-      isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" }),
-      async () => makeModelsResponse([]),
-    );
-    expect(discovery).toBeNull();
+  test("rejects a catalog without usable models", async () => {
+    await expect(discoverModels(testConfig(), async () => makeModelsResponse([]))).rejects.toThrow();
   });
 
   test("config path honors PI_CODING_AGENT_DIR", () => {

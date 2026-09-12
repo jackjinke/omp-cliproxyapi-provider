@@ -19,6 +19,8 @@ export CLIPROXYAPI_BASE_URL='http://127.0.0.1:8317' # optional
 
 These variables can also be placed in `~/.omp/agent/.env`. The base URL defaults to `http://127.0.0.1:8317`.
 
+Authentication is registered before model discovery. If discovery fails, the key remains available for already-known models; discovering new models still requires a successful catalog request. Each catalog request has a 15-second timeout covering both headers and body, and is cancelled on timeout. Set `CLIPROXYAPI_STARTUP_TIMEOUT_MS` to change this per-request limit. Discovery does not retry or launch external commands. Optional models.dev enrichment falls back to cached or CLIProxyAPI metadata when unavailable.
+
 The optional `~/.omp/agent/cliproxyapi.yml` file configures Codex transport opt-ins and per-model overrides. A bare model name applies to that model with or without a provider prefix; a provider-specific entry takes priority:
 
 ```yaml
