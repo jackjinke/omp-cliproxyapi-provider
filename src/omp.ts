@@ -128,7 +128,7 @@ export async function activateOmp(
 
   const discoveryStamp = Symbol("cliproxyapi.discovered");
   // Cache the built host models — including per-model api/baseUrl/compaction —
-  // because the startup rebind below must overwrite every transport field. A
+  // because model hydration must overwrite every transport field. A
   // provisional startup model can inherit a recently-used same-id variant from
   // another provider (e.g. omniroute's codex baseUrl), and assigning only
   // catalog metadata leaves that polluted baseUrl in place.
@@ -141,10 +141,11 @@ export async function activateOmp(
    * persisted `cliproxyapi/…` default arrives as a provisional model carrying
    * only its id. Re-selecting through `api.setModel` after registration lets
    * the host reconcile native image input and catalog capabilities. Switching
-   * sessions in a long-lived host brings in another unreconciled model object,
-   * so the same rebind runs on session_switch.
+   * sessions or models can supply another unreconciled model object: OMP's
+   * selector rebuilds registered models with the provider-level baseUrl. Run
+   * the same hydration before each turn so selection cannot lose the route.
    */
-  async function rebindStartupModel(_event: unknown, context: unknown): Promise<void> {
+  async function rebindModel(_event: unknown, context: unknown): Promise<void> {
     const ctx = context as { model?: unknown };
     const identity = extractModelIdentity(ctx?.model);
     if (!identity || identity.provider !== PROVIDER_NAME || !identity.id) return;
@@ -165,6 +166,7 @@ export async function activateOmp(
     }
   }
 
-  api.on("session_start", rebindStartupModel);
-  api.on("session_switch", rebindStartupModel);
+  api.on("session_start", rebindModel);
+  api.on("session_switch", rebindModel);
+  api.on("before_agent_start", rebindModel);
 }

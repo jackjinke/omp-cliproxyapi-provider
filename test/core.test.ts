@@ -426,6 +426,29 @@ describe("OMP adapter", () => {
     expect(host.providers[0].config.models[0].thinking?.defaultLevel).toBe("medium");
   });
 
+  test("model switches restore the response route before the next turn without changing effort", async () => {
+    const host = new FakeHost();
+    await activateOmp(host, isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" }), async () =>
+      makeModelsResponse([
+        { ...CODEX_ENTRY, slug: "gpt-6-astra" },
+        { ...CODEX_ENTRY, slug: "gpt-5.6-luna", default_reasoning_level: "medium" },
+      ]),
+    );
+    await host.emit("session_start", fakeContext({ provider: "cliproxyapi", id: "gpt-6-astra" }));
+    // OMP's selector rebuilds models with the provider-level URL.
+    const selected: FakeContextModel = {
+      provider: "cliproxyapi",
+      id: "gpt-5.6-luna",
+      api: "openai-codex-responses",
+      baseUrl: "http://127.0.0.1:8317/v1",
+    };
+    host.setThinkingLevel("xhigh");
+    await host.emit("before_agent_start", fakeContext(selected));
+    const requestUrl = new URL(`${selected.baseUrl}/codex/responses`);
+    expect(requestUrl.pathname).toBe("/v1/responses");
+    expect(host.getThinkingLevel()).toBe("xhigh");
+  });
+
   test("hydrates a provisional startup model from the catalog", async () => {
     const host = new FakeHost();
     const environment = isolatedEnv({ CLIPROXYAPI_API_KEY: "abc" });

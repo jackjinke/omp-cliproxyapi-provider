@@ -47,3 +47,5 @@ Select a discovered model with its CLIProxyAPI provider ID:
 ```bash
 omp --model cliproxyapi/<model-id>
 ```
+
+Model transport settings are restored at session startup, on session switches, and before each turn. This keeps model switches routed to CLIProxyAPI without changing the session's selected reasoning effort.
