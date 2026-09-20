@@ -1,3 +1,4 @@
+import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +24,7 @@ type FakeHandler = (event: { payload?: unknown }, context: FakeContext) => unkno
 class FakeHost implements OmpExtensionAPI {
   readonly providers: RegisteredProvider[] = [];
   readonly handlers = new Map<string, FakeHandler[]>();
-  thinkingLevel = "high";
+  thinkingLevel: "off" | `${Effort}` = "high";
   setModelCalls: unknown[] = [];
 
   registerProvider(name: string, config: OmpProviderConfig): void {
@@ -32,23 +33,19 @@ class FakeHost implements OmpExtensionAPI {
     else this.providers[index] = { name, config };
   }
 
-  getThinkingLevel(): string {
+  getThinkingLevel(): "off" | `${Effort}` | undefined {
     return this.thinkingLevel;
   }
 
-  setThinkingLevel(level: string): void {
+  setThinkingLevel(level: "off" | `${Effort}`): void {
     this.thinkingLevel = level;
   }
 
-  async setModel(model: unknown): Promise<boolean> {
+  async setModel(model: Model): Promise<boolean> {
     this.setModelCalls.push(model);
     await Promise.resolve();
-    if (model && typeof model === "object" && "thinking" in model) {
-      const thinking = model.thinking;
-      if (thinking && typeof thinking === "object" && "defaultLevel" in thinking &&
-          typeof thinking.defaultLevel === "string") {
-        this.setThinkingLevel(thinking.defaultLevel);
-      }
+    if (model.thinking?.defaultLevel !== undefined) {
+      this.setThinkingLevel(model.thinking.defaultLevel);
     }
     return true;
   }
@@ -192,17 +189,17 @@ describe("shared catalog logic", () => {
     expect(claude.contextWindow).toBe(200000);
     expect(claude.maxTokens).toBe(64000);
     expect(claude.name).toBe("Claude Opus 4.6");
-    expect(claude.thinking?.efforts).toEqual(["low", "medium", "high", "max"]);
+    expect(claude.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.Max]);
     expect(claude.input).toEqual(["text", "image"]);
     expect(claude.isClaude).toBe(true);
     expect(claude.isCodex).toBe(false);
 
     expect(codex.contextWindow).toBe(400000);
-    expect(codex.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(codex.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
     expect(codex.isCodex).toBe(true);
     expect(codex.isClaude).toBe(false);
 
-    expect(kimi.thinking?.efforts).toEqual(["low", "medium", "high"]);
+    expect(kimi.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High]);
     expect(kimi.isClaude).toBe(false);
     expect(kimi.isCodex).toBe(false);
   });
@@ -213,7 +210,7 @@ describe("shared catalog logic", () => {
       supported_reasoning_levels: ["auto", "none", "ultra", "low", "high"].map((effort) => ({ effort })),
     };
     const [model] = normalizeCatalog([entry], testConfig()).models;
-    expect(model.thinking?.efforts).toEqual(["low", "high"]);
+    expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.High]);
   });
 
   test("explicit empty and unsupported effort lists do not invent selectable levels", () => {
@@ -230,7 +227,7 @@ describe("shared catalog logic", () => {
   test("applies effort overrides as additive extras", () => {
     const config = testConfig({ modelOverrides: { "*": { efforts: ["minimal"] } } });
     const [model] = normalizeCatalog([CLAUDE_ENTRY], config).models;
-    expect(model.thinking?.efforts).toEqual(["low", "medium", "high", "max", "minimal"]);
+    expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.Max, Effort.Minimal]);
   });
 
   test("fills conservative defaults for sparse entries", () => {
@@ -265,7 +262,7 @@ describe("shared catalog logic", () => {
     const [model] = normalizeCatalog([sparse], testConfig()).models;
     expect(model.isCodex).toBe(true);
     expect(model.reasoning).toBe(true);
-    expect(model.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
     expect(model.contextWindow).toBe(272000);
     expect(model.maxTokens).toBe(128000);
   });
@@ -287,7 +284,7 @@ describe("shared catalog logic", () => {
     const config = testConfig({ modelOverrides: { "deepseek-v3.2": { efforts: ["low", "high"] } } });
     const [model] = normalizeCatalog([SPARSE_ENTRY], config).models;
     expect(model.reasoning).toBe(true);
-    expect(model.thinking?.efforts).toEqual(["low", "high"]);
+    expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.High]);
   });
 
   test("wildcard effort overrides do not invent reasoning", () => {
@@ -308,7 +305,7 @@ describe("shared catalog logic", () => {
     const [model] = normalizeCatalog([gemini], testConfig()).models;
     expect(model.contextWindow).toBe(1048576);
     expect(model.maxTokens).toBe(65536);
-    expect(model.thinking?.efforts).toEqual(["high"]);
+    expect(model.thinking?.efforts).toEqual([Effort.High]);
     expect(model.input).toEqual(["text", "image"]);
   });
 
@@ -329,7 +326,6 @@ describe("OMP adapter", () => {
     expect(host.providers).toHaveLength(1);
     const provider = host.providers[0];
     expect(provider.name).toBe("cliproxyapi");
-    expect(provider.config.name).toBe("CLIProxyAPI");
     expect(provider.config.baseUrl).toBe("http://127.0.0.1:8317/v1");
     expect(provider.config.apiKey).toBe("abc");
     expect(provider.config.api).toBe("openai-completions");
@@ -389,8 +385,8 @@ describe("OMP adapter", () => {
     const canonical = models.find((model) => model.id === "gpt-6-astra")!;
     expect(canonical.name).toBe("GPT 6.0 Astra");
     expect(canonical.input).toEqual(["text", "image"]);
-    expect(canonical.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(canonical.thinking?.defaultLevel).toBe("medium");
+    expect(canonical.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+    expect(canonical.thinking?.defaultLevel).toBe(Effort.Medium);
     expect(canonical.preferWebsockets).toBe(true);
     expect(canonical.useResponsesLite).toBe(false);
     const alias = models.find((model) => model.id === "GPT-6 Astra")!;
@@ -423,7 +419,7 @@ describe("OMP adapter", () => {
     host.setThinkingLevel("low");
     await host.emit("session_switch", fakeContext({ provider: "cliproxyapi", id: CODEX_ENTRY.slug }));
     expect(host.getThinkingLevel()).toBe("low");
-    expect(host.providers[0].config.models[0].thinking?.defaultLevel).toBe("medium");
+    expect(host.providers[0].config.models[0].thinking?.defaultLevel).toBe(Effort.Medium);
   });
 
   test("model switches restore the response route before the next turn without changing effort", async () => {

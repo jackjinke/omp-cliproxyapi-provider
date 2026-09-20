@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import type { Effort, Model } from "@oh-my-pi/pi-ai";
 
 export interface CPAModel {
   id: string;
@@ -9,22 +10,11 @@ export interface CPAModel {
   isCodex: boolean;
   isClaude: boolean;
   reasoning: boolean;
-  thinking?: {
-    mode: "effort";
-    efforts: string[];
-    effortMap: Record<string, string>;
-    defaultLevel?: string;
-  };
-  thinkingLevelMap?: Record<string, string>;
+  thinking?: Model["thinking"];
   preferWebsockets?: boolean;
   input: ("text" | "image")[];
   supportsTools: boolean;
-  cost: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-  };
+  cost: Model["cost"];
   contextWindow: number;
   maxTokens: number;
   compat: {
@@ -52,6 +42,7 @@ export interface CPAModelOverride {
 export interface CPAConfig {
   apiKey: string;
   baseUrl: string;
+  codexBaseUrl?: string;
   startupTimeoutMs: number;
   modelOverrides: Record<string, CPAModelOverride>;
 }
@@ -62,6 +53,7 @@ export interface ModelsDevModelInfo {
   input?: ("text" | "image")[];
   reasoning?: boolean;
   supportsTools?: boolean;
+  cost?: CPAModel["cost"];
 }
 
 /**
@@ -74,7 +66,7 @@ export type ModelsDevIndex = Record<string, ModelsDevModelInfo>;
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8317";
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
-const DEFAULT_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const DEFAULT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as Effort[];
 const SUPPORTED_EFFORTS: Record<string, true> = {
   minimal: true,
   low: true,
@@ -101,11 +93,11 @@ export function cliproxyapiConfigPath(environment: Environment = process.env): s
   return join(homedir(), ".omp", "agent", "cliproxyapi.yml");
 }
 
-function normalizeEfforts(value: unknown): string[] {
+function normalizeEfforts(value: unknown): Effort[] {
   if (!Array.isArray(value)) return [];
   return value
     .map((effort) => String(effort).trim().toLowerCase())
-    .filter((effort) => effort in SUPPORTED_EFFORTS);
+    .filter((effort): effort is Effort => Object.hasOwn(SUPPORTED_EFFORTS, effort));
 }
 
 export function readConfig(
@@ -119,7 +111,7 @@ export function readConfig(
 
   const config: CPAConfig = {
     apiKey,
-    baseUrl: (environment.CLIPROXYAPI_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    ...normalizeBaseUrl(environment.CLIPROXYAPI_BASE_URL?.trim() || DEFAULT_BASE_URL),
     startupTimeoutMs: normalizeTimeout(environment.CLIPROXYAPI_STARTUP_TIMEOUT_MS),
     modelOverrides: {},
   };
@@ -140,6 +132,26 @@ export function readConfig(
     }
 
   return config;
+}
+
+function normalizeBaseUrl(raw: string): Pick<CPAConfig, "baseUrl" | "codexBaseUrl"> {
+  let url: URL;
+  try {
+    if (/\s|\\/.test(raw) || raw.startsWith("/")) throw new Error();
+    const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(raw) && !/^[^/:]+:\d+(?:\/|$)/.test(raw);
+    if (hasScheme && !/^https?:\/\/[^/]/i.test(raw)) throw new Error();
+    url = new URL(hasScheme ? raw : `http://${raw}`);
+    if (!/^https?:$/.test(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) {
+      throw new Error();
+    }
+  } catch {
+    throw new Error("CLIPROXYAPI_BASE_URL must be an HTTP(S) server URL without credentials, query, or fragment");
+  }
+  const path = url.pathname.replace(/\/+$/, "");
+  const native = /\/backend-api(?:\/codex(?:\/responses)?)?$/.exec(path);
+  const rootPath = native ? path.slice(0, native.index) : path.replace(/\/v1$/, "");
+  const baseUrl = `${url.origin}${rootPath}`;
+  return native ? { baseUrl, codexBaseUrl: `${baseUrl}/backend-api` } : { baseUrl };
 }
 
 function normalizeTimeout(raw: string | undefined): number {
@@ -213,6 +225,34 @@ function normalizeModelsDevKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function parseModelsDevCost(value: unknown): CPAModel["cost"] | undefined {
+  const record = firstRecord(value);
+  if (!record) return undefined;
+  const rate = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+  const rates = (entry: Record<string, unknown>) => ({
+    input: rate(entry.input),
+    output: rate(entry.output),
+    cacheRead: rate(entry.cache_read),
+    cacheWrite: rate(entry.cache_write),
+  });
+  const cost: CPAModel["cost"] = rates(record);
+  let threshold = Infinity;
+  for (const value of firstArray(record.tiers)) {
+    const entry = firstRecord(value);
+    const tier = firstRecord(entry?.tier);
+    const size = tier?.size;
+    if (entry && tier?.type === "context" && typeof size === "number" && Number.isFinite(size) && size > 0 && size < threshold) {
+      threshold = size;
+      cost.longContext = { ...rates(entry), inputThreshold: size };
+    }
+  }
+  // OMP represents one long-context tier; use the first threshold, not a later
+  // price that would incorrectly apply to shorter requests.
+  const legacy = firstRecord(record.context_over_200k);
+  if (!cost.longContext && legacy) cost.longContext = { ...rates(legacy), inputThreshold: 200_000 };
+  return cost;
+}
+
 function indexModelsDevPayload(payload: unknown): ModelsDevIndex {
   const index: ModelsDevIndex = {};
   if (!payload || typeof payload !== "object") return index;
@@ -231,6 +271,7 @@ function indexModelsDevPayload(payload: unknown): ModelsDevIndex {
         input: firstArray(modalities?.input).length > 0 ? normalizeInputModalities(modalities?.input) : undefined,
         reasoning: typeof record.reasoning === "boolean" ? record.reasoning : undefined,
         supportsTools: typeof record.tool_call === "boolean" ? record.tool_call : undefined,
+        cost: parseModelsDevCost(record.cost),
       };
       const scopedKey = `${normalizeModelsDevKey(providerId)}/${normalizeModelsDevKey(modelId)}`;
       index[scopedKey] ??= info;
@@ -398,13 +439,13 @@ function parseEfforts(
   entry: Record<string, unknown>,
   config: CPAConfig,
   id: string,
-): string[] {
-  const override = modelOverride(config, id).efforts;
+): Effort[] {
+  const override = normalizeEfforts(modelOverride(config, id).efforts);
   if (!Array.isArray(entry.supported_reasoning_levels)) {
-    return override && override.length > 0 ? override : [...DEFAULT_EFFORTS];
+    return override.length > 0 ? override : [...DEFAULT_EFFORTS];
   }
   const efforts = normalizeEfforts(entry.supported_reasoning_levels.map((value) => firstRecord(value)?.effort));
-  return [...new Set([...efforts, ...(override ?? [])])];
+  return [...new Set([...efforts, ...override])];
 }
 
 function applyModelOverrides(model: CPAModel, config: CPAConfig): void {
@@ -421,35 +462,36 @@ export function extractCPAModel(
   modelsDev?: ModelsDevIndex,
 ): CPAModel | null {
   const id = firstString(entry.slug);
-  if (!id) return null;
+  if (!id || entry.visibility === "hide") return null;
   const name = firstString(entry.display_name) ?? id;
   const owner = normalizeModelsDevKey(firstString(entry.owned_by) ?? "");
+  const modelName = id.slice(id.lastIndexOf("/") + 1);
+  const canonicalName = owner === "google" && modelName === "gemini-pro-agent" ? "gemini-3.1-pro-preview" : modelName;
   const metadata = owner && modelsDev ? (
     modelsDev[`${owner}/${normalizeModelsDevKey(id)}`] ??
+    modelsDev[`${owner}/${normalizeModelsDevKey(canonicalName)}`] ??
     modelsDev[`${owner}/${normalizeModelsDevKey(name)}`]
   ) : undefined;
   const override = modelOverride(config, id);
-  const modelName = id.slice(id.lastIndexOf("/") + 1);
   const hasExplicitEfforts =
     config.modelOverrides[id]?.efforts !== undefined ||
     config.modelOverrides[modelName]?.efforts !== undefined;
-  const isClaude = id.startsWith("claude-");
+  const isClaude = modelName.startsWith("claude-");
   const isCodex =
-    id.startsWith("gpt-") ||
-    id.startsWith("codex-") ||
-    id.includes("/gpt-") ||
+    modelName.startsWith("gpt-") ||
+    modelName.startsWith("codex-") ||
     override.codexTransport === true;
   // Explicit empty effort lists must not acquire fallback levels. Image models
   // can inherit a Codex template's effort list without supporting reasoning.
   const reasoning = hasExplicitEfforts || (
-    metadata?.reasoning ?? (!id.startsWith("gpt-image") && (
+    metadata?.reasoning ?? (!modelName.startsWith("gpt-image") && (
       firstArray(entry.supported_reasoning_levels).length > 0 ||
       (isCodex && !Array.isArray(entry.supported_reasoning_levels))
     ))
   );
   const efforts = reasoning ? parseEfforts(entry, config, id) : [];
   const effortMap = Object.fromEntries(efforts.map((effort) => [effort, effort]));
-  const defaultLevel = firstString(entry.default_reasoning_level);
+  const defaultLevel = normalizeEfforts([entry.default_reasoning_level])[0];
 
   const model: CPAModel = {
     id,
@@ -463,12 +505,11 @@ export function extractCPAModel(
       effortMap,
       defaultLevel: defaultLevel && efforts.includes(defaultLevel) ? defaultLevel : undefined,
     } : undefined,
-    thinkingLevelMap: efforts.length > 0 ? effortMap : undefined,
     input: metadata?.input ?? normalizeInputModalities(entry.input_modalities),
     supportsTools: metadata?.supportsTools ?? true,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: metadata?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: metadata?.contextWindow ?? firstInteger(entry.context_window, entry.max_context_window) ?? FALLBACK_CONTEXT_WINDOW,
-    maxTokens: metadata?.maxTokens ?? firstInteger(entry.max_tokens) ?? FALLBACK_MAX_TOKENS,
+    maxTokens: metadata?.maxTokens ?? firstInteger(entry.max_tokens, entry.max_output_tokens, entry.max_completion_tokens) ?? FALLBACK_MAX_TOKENS,
     compat: {
       supportsReasoningParams: reasoning,
       supportsReasoningEffort: reasoning,
