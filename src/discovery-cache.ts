@@ -10,7 +10,7 @@ export function catalogCachePath(config: CPAConfig, configPath: string): string 
   const scope = createHash("sha256").update(JSON.stringify([
     CACHE_VERSION, config.baseUrl, config.codexBaseUrl, config.apiKey, config.modelOverrides,
   ])).digest("hex");
-  return join(dirname(configPath), "cliproxyapi-catalog", `${scope}.json`);
+  return join(dirname(configPath), "cache", "cliproxyapi", `${scope}.json`);
 }
 
 function record(value: unknown): value is Record<string, unknown> {

@@ -50,6 +50,7 @@ test("catalog cache is scoped to endpoint, key, native route and model overrides
   const configPath = cliproxyapiConfigPath(env);
   const config = readConfig(env, configPath);
   const path = catalogCachePath(config, configPath);
+  expect(path.startsWith(join(env.PI_CODING_AGENT_DIR, "cache", "cliproxyapi") + "/")).toBe(true);
   expect(readCatalogCache(path)?.[0]?.id).toBe("gpt-6-astra");
   expect(readFileSync(path, "utf8")).not.toContain(env.CLIPROXYAPI_API_KEY);
   for (const changed of [{ ...config, apiKey: "other" }, { ...config, baseUrl: "http://other" }, { ...config, codexBaseUrl: "http://localhost:8317/backend-api" }, { ...config, modelOverrides: { "gpt-6-astra": { contextWindow: 9000 } } }]) {
